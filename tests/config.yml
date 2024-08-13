@@ -10,7 +10,6 @@ optimise:
   opt_n_trials: 50
 
 cross_val:
-  cv_nfold: 3
   cv_num_boost_round: 100
 
 plot:
