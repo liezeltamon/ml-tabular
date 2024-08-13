@@ -10,6 +10,7 @@
 
 __pycache__/
 *.py[cod]
+*.pkl
 
 *.utf8.md
 *.knit.md
@@ -19,10 +20,12 @@ __pycache__/
 *.log.err
 sps-*
 
+*.csv
 *.tar
 *.gz
 *.html
 *.pdf
+*.png
 *.xlsx
 
 data-raw/
@@ -31,3 +34,6 @@ data-raw/
 z_ignore_git/
 
 !data-raw/README.md
+
+# Project-specific
+tests/*.json
