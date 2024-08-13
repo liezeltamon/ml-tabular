@@ -1,7 +1,6 @@
 # LightGBM CV + Optuna for tabular data
 
 #%%
-
 import lightgbm as lgb
 import matplotlib.pyplot as plt
 import numpy as np
@@ -9,11 +8,12 @@ import optuna
 import pandas as pd
 from plotnine import ggplot, geom_point, aes, theme_classic, labs
 from sklearn.datasets import load_breast_cancer, load_diabetes
+from sklearn.dummy import DummyRegressor, DummyClassifier
+from sklearn.metrics import mean_squared_error, roc_auc_score
 import joblib, json, yaml
 
 #%%
 # Parameters
-
 with open("config.yml", "r") as file:
     config = yaml.safe_load(file)
 
@@ -24,7 +24,7 @@ opt_direction = config["optimise"]["opt_direction"]
 opt_n_trials = int(config["optimise"]["opt_n_trials"])
 plot_n_trials = config["plot"]["plot_n_trials"] # If None, plot all trials
 num_cores = int(config["general"]["num_cores"])
-cv_nfold = int(config["cross_val"]["cv_nfold"])
+#cv_nfold = int(config["cross_val"]["cv_nfold"])
 cv_num_boost_round = int(config["cross_val"]["cv_num_boost_round"])
 test = config["general"]["test"]
 
@@ -103,6 +103,21 @@ study_df["number"] = pd.Categorical(study_df["number"], categories=study_df['num
 study_df.head()
 
 #%%
+# Crate naive model/s and get metrics
+if objective_type == "regression":
+    naive_model = DummyRegressor(strategy="mean")
+    naive_model.fit(data, target)
+    naive_target = naive_model.predict(data)
+    naive_metrics = mean_squared_error(target, naive_target, squared=False)
+    naive_metrics = np.full(cv_num_boost_round, naive_metrics).tolist()
+elif objective_type == "binary":
+    naive_model = DummyClassifier(strategy="stratified")
+    naive_model.fit(data, target)
+    naive_target = naive_model.predict_proba(data)[:,1]
+    naive_metrics = roc_auc_score(target, naive_target)
+    naive_metrics = np.full(cv_num_boost_round, naive_metrics).tolist()
+    
+#%%
 ### 1) Plot showing rank of trials
 
 p = (
@@ -127,7 +142,7 @@ fig, axes = plt.subplots(num_rows, num_cols, figsize=(5*num_cols, 5*num_rows))
 minmax_array = np.full((study_df.shape[0], 2), None)
 for i, trial_number in enumerate(study_df["number"]):
     trial_results = study.trials[int(trial_number)].user_attrs["trial_results"]
-    all_metrics = trial_results["train " + eval_metric + "-mean"] + trial_results["valid " + eval_metric + "-mean"]
+    all_metrics = trial_results["train " + eval_metric + "-mean"] + trial_results["valid " + eval_metric + "-mean"] + naive_metrics
     minmax_array[i,0] = min(all_metrics)
     minmax_array[i,1] = max(all_metrics)
 min_eval_metric = np.min(minmax_array)
@@ -145,6 +160,7 @@ for i, trial_number in enumerate(study_df["number"]):
     col_idx = i % num_cols
     axes[row_idx, col_idx].plot(iter_nums, train_metrics, color="turquoise", label="Train")
     axes[row_idx, col_idx].plot(iter_nums, valid_metrics, color="darkviolet", label="Validation")
+    axes[row_idx, col_idx].plot(iter_nums, naive_metrics, color="grey", label="Naive")
     axes[row_idx, col_idx].set_xlabel("Iteration")
     axes[row_idx, col_idx].set_ylabel(f"Objective value: {eval_metric}")
     axes[row_idx, col_idx].set_title(f"Trial {trial_number}")
@@ -175,4 +191,7 @@ trial_cvbooster = trial_results["cvbooster"]
 trial_cvbooster.feature_importance(importance_type="gain")
 trial_cvbooster.feature_importance(importance_type="split")
 
+# Save both split and gain from each trial so you can decide how to rank all features
+# Get ave split and gain for each feature across all trials and folds
+# then plot split x gain     
 # %%
