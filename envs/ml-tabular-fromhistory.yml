@@ -1,0 +1,19 @@
+name: ml-tabular
+channels:
+  - bioconda
+  - conda-forge
+  - defaults
+dependencies:
+  - scikit-learn
+  - ca-certificates
+  - openssl
+  - lightgbm
+  - pandas
+  - plotnine
+  - ipykernel
+  - xgboost
+  - certifi
+  - plotly
+  - optuna
+  - nbformat
+prefix: /Users/ltamon/local/mamba_installation/conda/envs/ml-tabular
