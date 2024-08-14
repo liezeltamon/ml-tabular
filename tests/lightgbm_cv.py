@@ -5,6 +5,7 @@ import lightgbm as lgb
 import matplotlib.pyplot as plt
 import numpy as np
 import optuna
+from optuna.visualization import plot_optimization_history, plot_param_importances, plot_slice, plot_timeline, plot_rank
 import pandas as pd
 from plotnine import ggplot, geom_point, aes, theme_classic, labs
 from sklearn.datasets import load_breast_cancer, load_diabetes
@@ -24,8 +25,8 @@ opt_direction = config["optimise"]["opt_direction"]
 opt_n_trials = int(config["optimise"]["opt_n_trials"])
 plot_n_trials = config["plot"]["plot_n_trials"] # If None, plot all trials
 num_cores = int(config["general"]["num_cores"])
-#cv_nfold = int(config["cross_val"]["cv_nfold"])
-cv_num_boost_round = int(config["cross_val"]["cv_num_boost_round"])
+num_boost_round = int(config["predict"]["num_boost_round"])
+nfold = int(config["predict"]["nfold"])
 test = config["general"]["test"]
 
 #%%
@@ -45,7 +46,7 @@ else:
 #%%
 # Optimise hyperparameters
 
-def objective(trial, data=data, target=target, objective_type=objective_type, eval_metric=eval_metric, cv_num_boost_round=cv_num_boost_round, cv_nfold=cv_nfold):
+def objective(trial, data=data, target=target, objective_type=objective_type, eval_metric=eval_metric, num_boost_round=num_boost_round, nfold=nfold):
 
     # Should be inside the objective function to not get this error:
     # LightGBMError: Reducing `min_data_in_leaf` with `feature_pre_filter=true` may cause unexpected behaviour for features that were pre-filtered by the larger `min_data_in_leaf`.
@@ -56,7 +57,6 @@ def objective(trial, data=data, target=target, objective_type=objective_type, ev
         "metric": eval_metric,
         "verbosity": -1,
         "boosting_type": "gbdt",
-        "nfold": trial.suggest_int("nfold", 3, 10),
         "lambda_l1": trial.suggest_float("lambda_l1", 1e-8, 10.0, log=True),
         "lambda_l2": trial.suggest_float("lambda_l2", 1e-8, 10.0, log=True),
         "num_leaves": trial.suggest_int("num_leaves", 2, 256),
@@ -69,11 +69,10 @@ def objective(trial, data=data, target=target, objective_type=objective_type, ev
     trial_results = lgb.cv(
         param,
         dtrain,
-        num_boost_round=cv_num_boost_round,
-        #nfold=cv_nfold,
-        stratified=True,
-        shuffle=True,
-        metrics=eval_metric,
+        num_boost_round=num_boost_round,
+        nfold=nfold,
+        stratified=True, # Default
+        shuffle=True, # Default
         seed=trial.number,
         eval_train_metric=True,
         return_cvbooster=True,
@@ -97,7 +96,9 @@ study.optimize(objective, n_trials=opt_n_trials, n_jobs = num_cores)
 # Assess whether you need to repeat optimisation or not
 
 study_df = study.trials_dataframe()
-study_df.sort_values("value", ascending=False, inplace=True)
+if opt_direction == "minimize":
+    sort_direction = True
+study_df.sort_values("value", ascending=sort_direction, inplace=True)
 study_df.to_csv("trials_study.csv", index=False)
 study_df["number"] = pd.Categorical(study_df["number"], categories=study_df['number'].unique(), ordered=True)
 study_df.head()
@@ -109,14 +110,13 @@ if objective_type == "regression":
     naive_model.fit(data, target)
     naive_target = naive_model.predict(data)
     naive_metrics = mean_squared_error(target, naive_target, squared=False)
-    naive_metrics = np.full(cv_num_boost_round, naive_metrics).tolist()
-elif objective_type == "binary":
+elif objective_type in ["binary", "multiclass"]:
     naive_model = DummyClassifier(strategy="stratified")
     naive_model.fit(data, target)
     naive_target = naive_model.predict_proba(data)[:,1]
     naive_metrics = roc_auc_score(target, naive_target)
-    naive_metrics = np.full(cv_num_boost_round, naive_metrics).tolist()
-    
+naive_metrics = np.full(num_boost_round, naive_metrics).tolist()
+
 #%%
 ### 1) Plot showing rank of trials
 
@@ -126,10 +126,11 @@ p = (
     + labs(y = "Optimisation value", x = "Trial number")
     + theme_classic()
 )
-p.save("trials_rank.png", dpi=300)
+p.save("trials_rank.pdf", dpi=300)
 
 #%%
 #### 2) Plot validation and training metrics across iterations to compare best and worst trials
+
 if plot_n_trials is not None:
     plot_trials_inds = np.linspace(0, study_df.shape[0] - 1, num=int(plot_n_trials), endpoint=True, dtype=int)
     study_df = study_df.iloc[plot_trials_inds, :]
@@ -148,7 +149,6 @@ for i, trial_number in enumerate(study_df["number"]):
 min_eval_metric = np.min(minmax_array)
 max_eval_metric = np.max(minmax_array)
 
-#%%
 for i, trial_number in enumerate(study_df["number"]):
     #trial_results = joblib.load(f"trial_results_{trial_number}.pkl")
     trial_results = study.trials[int(trial_number)].user_attrs["trial_results"]
@@ -158,40 +158,52 @@ for i, trial_number in enumerate(study_df["number"]):
     
     row_idx = i // num_cols
     col_idx = i % num_cols
+    axes[row_idx, col_idx].plot(iter_nums, naive_metrics, color="grey", label="Naive")
     axes[row_idx, col_idx].plot(iter_nums, train_metrics, color="turquoise", label="Train")
     axes[row_idx, col_idx].plot(iter_nums, valid_metrics, color="darkviolet", label="Validation")
-    axes[row_idx, col_idx].plot(iter_nums, naive_metrics, color="grey", label="Naive")
     axes[row_idx, col_idx].set_xlabel("Iteration")
     axes[row_idx, col_idx].set_ylabel(f"Objective value: {eval_metric}")
     axes[row_idx, col_idx].set_title(f"Trial {trial_number}")
     axes[row_idx, col_idx].legend()
-    axes[row_idx, col_idx].set_xlim(0, cv_num_boost_round)
+    axes[row_idx, col_idx].set_xlim(0, num_boost_round)
     axes[row_idx, col_idx].set_ylim(min_eval_metric - (0.1 * min_eval_metric), max_eval_metric + (0.1 * max_eval_metric))
 fig.tight_layout()
-fig.savefig("trials_metrics.png", dpi=300)
+fig.savefig("trials_metrics.pdf", dpi=300)
 plt.show()
 
 #%%
-# **Further explore study**
-# Most important hyperparameters, performance for each range of heperparameters, etc.
-# See https://optuna.readthedocs.io/en/stable/tutorial/10_key_features/005_visualization.html#visualization
-# and https://optuna.readthedocs.io/en/stable/reference/visualization/matplotlib.html
+#### 3) Optimisation diagnostic plots
 
-#from optuna.visualization.matplotlib import plot_param_importances
-from optuna.visualization import plot_optimization_history
-from optuna.visualization import plot_param_importances
-plot_optimization_history(study)
-plot_param_importances(study)
+fig = plot_optimization_history(study)
+fig.write_image("plot_optimisation_history.pdf", height = 4*300, width = 6*300, engine="kaleido")
+
+fig = plot_param_importances(study)
+#n_mostimportant_param = fig.data[0]["y"][::-1][:5]
+fig.write_image("plot_param_importances.pdf", height = 8*300, width = 6*300, engine="kaleido")
+
+fig = plot_slice(study)
+fig.write_image("plot_slice.pdf", height = 3*300, width = 12*300, engine="kaleido")
+
+fig = plot_rank(study)
+fig.write_image("plot_rank.pdf", height = 3*300, width = 12*300, engine="kaleido")
+
+fig = plot_timeline(study)
+fig.write_image("plot_timeline.pdf", height = 3*300, width = 4*300, engine="kaleido")
 
 #%% 
-# Explore feature importance
-trial_number = 2
-trial_results = joblib.load(f"trial_results_{trial_number}.pkl")
-trial_cvbooster = trial_results["cvbooster"]
-trial_cvbooster.feature_importance(importance_type="gain")
-trial_cvbooster.feature_importance(importance_type="split")
-
 # Save both split and gain from each trial so you can decide how to rank all features
 # Get ave split and gain for each feature across all trials and folds
-# then plot split x gain     
+# then plot split x gain
+for i, trial_number in enumerate(study_df["number"]):
+    trial_results = joblib.load(f"trial_results_{trial_number}.pkl")
+    trial_cvbooster = trial_results["cvbooster"]
+    
+    if not all([trial_cvbooster.feature_name()[0] == i for i in trial_cvbooster.feature_name()]):
+        raise ValueError(f"Trial number {trial_number}: Feature names are not the same across all folds")
+    else:
+        for j in ["gain", "split"]:
+            df = pd.DataFrame(trial_cvbooster.feature_importance(importance_type=j)).T
+            df.index = trial_cvbooster.feature_name()[0]
+            df.to_csv(f"trial_{trial_number}_{j}.csv")
+        
 # %%
