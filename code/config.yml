@@ -1,0 +1,17 @@
+general:
+  random_state: 290
+  eval_metric: "rmse"
+  objective_type: "regression"
+  test: true
+  num_cores: 1
+
+optimise:
+  opt_direction: "minimize"
+  opt_n_trials: 10
+
+predict:
+  num_boost_round: 100
+  nfold: 3
+
+plot:
+  plot_n_trials: null
