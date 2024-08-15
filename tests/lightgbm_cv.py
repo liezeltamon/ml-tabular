@@ -10,6 +10,7 @@ import pandas as pd
 from plotnine import ggplot, geom_point, aes, theme_classic, labs
 from sklearn.datasets import load_breast_cancer, load_diabetes
 from sklearn.dummy import DummyRegressor, DummyClassifier
+from sklego.dummy import RandomRegressor
 from sklearn.metrics import mean_squared_error, roc_auc_score
 import joblib, json, yaml
 
@@ -36,21 +37,62 @@ if test and objective_type in ["binary", "multiclass"]:
 elif test and objective_type == "regression":
     data, target = load_diabetes(return_X_y=True)
 elif not test:
-    data = pd.read_csv("data.csv")
-    target = pd.read_csv("target.csv")
+    try:
+        data = pd.read_csv("data.csv")
+        target = pd.read_csv("target.csv")
+    except Exception as e:
+        print(f"Error reading CSV files: {e}")
+        data = pd.read_feather("data.feather")
+        target = pd.read_feather("target.feather")
 else:
     raise ValueError("Problem with data loading")
+
 #%%
 # **Preprocessing**
+
+#### 1) Missing values
+
+data_missing = data.isnull().sum()
+target_missing = target.isnull().sum()
+print("Missing values in data:")
+print(data_missing[data_missing > 0])
+print("Missing values in target:")
+print(target_missing[target_missing > 0])
+
+# https://cornellius.substack.com/p/python-packages-for-automated-eda
+
+# # from ydata_profiling import ProfileReport
+# profile = ProfileReport(pd.concat([data, target], axis=1), title="Pandas Profiling Report", explorative=True)
+# profile.to_file("data_report.html")
+
+# import sweetviz as sv
+# combined_df = pd.concat([data, target], axis=1)
+# my_report = sv.analyze(pd.concat([data, target], axis=1), pairwise_analysis = "off")
+# my_report.show_html()
+
+# import missingno as msno
+# collisions = pd.read_csv("https://raw.githubusercontent.com/ResidentMario/missingno-data/master/nyc_collision_factors.csv")
+# import missingno as msno
+# %matplotlib inline
+# msno.matrix(collisions.sample(250))
+# (collisions.sample(250)).head()
+# msno.matrix(pd.concat([data, target], axis=1))
+
+#### 2) **Feature selection**
+
+#### 3) **Feature engineering**
 
 #%%
 # Optimise hyperparameters
 
-def objective(trial, data=data, target=target, objective_type=objective_type, eval_metric=eval_metric, num_boost_round=num_boost_round, nfold=nfold):
+def objective(trial, data=data, target=target, objective_type=objective_type, eval_metric=eval_metric, num_boost_round=num_boost_round, nfold=nfold, random_state=random_state):
 
     # Should be inside the objective function to not get this error:
     # LightGBMError: Reducing `min_data_in_leaf` with `feature_pre_filter=true` may cause unexpected behaviour for features that were pre-filtered by the larger `min_data_in_leaf`.
     dtrain = lgb.Dataset(data, label=target)
+
+    if objective_type == "regression":
+        stratified = False # Default is lightgbm.cv(stratified=True)
 
     param = {
         "objective": objective_type,
@@ -70,10 +112,12 @@ def objective(trial, data=data, target=target, objective_type=objective_type, ev
         param,
         dtrain,
         num_boost_round=num_boost_round,
+        # See https://stackoverflow.com/questions/54709800/why-cant-i-match-lgbms-cv-score
+        # folds = None # Use folds parameters to control how data is split and use if for shap later on
         nfold=nfold,
-        stratified=True, # Default
+        stratified=stratified,
         shuffle=True, # Default
-        seed=trial.number,
+        seed=random_state,
         eval_train_metric=True,
         return_cvbooster=True,
     )
@@ -106,16 +150,22 @@ study_df.head()
 #%%
 # Crate naive model/s and get metrics
 if objective_type == "regression":
-    naive_model = DummyRegressor(strategy="mean")
-    naive_model.fit(data, target)
-    naive_target = naive_model.predict(data)
-    naive_metrics = mean_squared_error(target, naive_target, squared=False)
+    naive_values_dict = {}
+    for strat in ["mean", "median", "uniform", "normal"]:
+        if strat in ["mean", "median"]:
+            naive_target = DummyRegressor(strategy=strat).fit(data, target).predict(data)
+        elif strat in ["uniform", "normal"]:
+             # Based on https://koaning.github.io/scikit-lego/api/dummy/#sklego.dummy.RandomRegressor
+            naive_target = RandomRegressor(strategy=strat, random_state=random_state).fit(data, target).predict(data)
+        naive_values_dict[strat] = mean_squared_error(target, naive_target, squared=False)
+    
 elif objective_type in ["binary", "multiclass"]:
-    naive_model = DummyClassifier(strategy="stratified")
-    naive_model.fit(data, target)
-    naive_target = naive_model.predict_proba(data)[:,1]
-    naive_metrics = roc_auc_score(target, naive_target)
-naive_metrics = np.full(num_boost_round, naive_metrics).tolist()
+    naive_values_dict = {}
+    for strat in ["most_frequent", "stratified", "uniform"]:
+        naive_target = DummyClassifier(strategy=strat).fit(data, target).predict_proba(data)[:,1]
+        naive_values_dict[strat] = roc_auc_score(target, naive_target)
+
+#naive_metrics = {strat: np.full(num_boost_round, naive_value).tolist() for strat, naive_value in naive_values_dict.items()}
 
 #%%
 ### 1) Plot showing rank of trials
@@ -141,13 +191,17 @@ fig, axes = plt.subplots(num_rows, num_cols, figsize=(5*num_cols, 5*num_rows))
 
 # Get range of objective value for make y-axis consistent across all plots
 minmax_array = np.full((study_df.shape[0], 2), None)
+naive_values_list = [float(i) for i in naive_values_dict.values()]
+
 for i, trial_number in enumerate(study_df["number"]):
     trial_results = study.trials[int(trial_number)].user_attrs["trial_results"]
-    all_metrics = trial_results["train " + eval_metric + "-mean"] + trial_results["valid " + eval_metric + "-mean"] + naive_metrics
+    all_metrics = trial_results["train " + eval_metric + "-mean"] + trial_results["valid " + eval_metric + "-mean"] + naive_values_list
     minmax_array[i,0] = min(all_metrics)
     minmax_array[i,1] = max(all_metrics)
 min_eval_metric = np.min(minmax_array)
 max_eval_metric = np.max(minmax_array)
+
+line_styles = {"mean": "--", "median": "-.", "uniform": ":", "normal": "-", "stratified": "--", "most_frequent": "-."}
 
 for i, trial_number in enumerate(study_df["number"]):
     #trial_results = joblib.load(f"trial_results_{trial_number}.pkl")
@@ -158,7 +212,8 @@ for i, trial_number in enumerate(study_df["number"]):
     
     row_idx = i // num_cols
     col_idx = i % num_cols
-    axes[row_idx, col_idx].plot(iter_nums, naive_metrics, color="grey", label="Naive")
+    for strat, naive_value in naive_values_dict.items():
+        axes[row_idx, col_idx].axhline(y=float(naive_value), color="grey", linestyle=line_styles[strat], label=f"Naive: {strat}")
     axes[row_idx, col_idx].plot(iter_nums, train_metrics, color="turquoise", label="Train")
     axes[row_idx, col_idx].plot(iter_nums, valid_metrics, color="darkviolet", label="Validation")
     axes[row_idx, col_idx].set_xlabel("Iteration")
@@ -207,3 +262,15 @@ for i, trial_number in enumerate(study_df["number"]):
             df.to_csv(f"trial_{trial_number}_{j}.csv")
         
 # %%
+
+import shap
+# Using SHAP with Cross-Validation in Python - https://towardsdatascience.com/using-shap-with-cross-validation-d24af548fadc
+# Sample input data
+X_sample = data #X_test.iloc[:100]  # Replace with your actual data
+trial_results = joblib.load(f"trial_results_{trial_number}.pkl")
+boosters = trial_results["cvbooster"].boosters
+# Loop through each booster and calculate SHAP values
+for booster in boosters:
+    explainer = shap.TreeExplainer(booster)
+    shap_values = explainer.shap_values(X_sample)
+    shap.summary_plot(shap_values, X_sample, max_display=30)
