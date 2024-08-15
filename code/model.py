@@ -30,57 +30,36 @@ num_boost_round = int(config["predict"]["num_boost_round"])
 nfold = int(config["predict"]["nfold"])
 test = config["general"]["test"]
 
+data_path = "../data/data.feather"
+target_path = "../data/target.feather"
+
 #%%
 # Load data
 if test and objective_type in ["binary", "multiclass"]:
-    data, target = load_breast_cancer(return_X_y=True)
+    data, target = load_breast_cancer(return_X_y=True, as_frame=True)
 elif test and objective_type == "regression":
-    data, target = load_diabetes(return_X_y=True)
+    data, target = load_diabetes(return_X_y=True, as_frame=True)
 elif not test:
     try:
-        data = pd.read_csv("data.csv")
-        target = pd.read_csv("target.csv")
+        data = pd.read_csv(data_path)
+        target = pd.read_csv("target_path")
     except Exception as e:
         print(f"Error reading CSV files: {e}")
-        data = pd.read_feather("data.feather")
-        target = pd.read_feather("target.feather")
+        data = pd.read_feather(data_path)
+        target = pd.read_feather(target_path)
 else:
     raise ValueError("Problem with data loading")
 
 #%%
 # **Preprocessing**
 
-#### 1) Missing values
-
+#### Missing values
 data_missing = data.isnull().sum()
 target_missing = target.isnull().sum()
 print("Missing values in data:")
 print(data_missing[data_missing > 0])
 print("Missing values in target:")
 print(target_missing[target_missing > 0])
-
-# https://cornellius.substack.com/p/python-packages-for-automated-eda
-
-# # from ydata_profiling import ProfileReport
-# profile = ProfileReport(pd.concat([data, target], axis=1), title="Pandas Profiling Report", explorative=True)
-# profile.to_file("data_report.html")
-
-# import sweetviz as sv
-# combined_df = pd.concat([data, target], axis=1)
-# my_report = sv.analyze(pd.concat([data, target], axis=1), pairwise_analysis = "off")
-# my_report.show_html()
-
-# import missingno as msno
-# collisions = pd.read_csv("https://raw.githubusercontent.com/ResidentMario/missingno-data/master/nyc_collision_factors.csv")
-# import missingno as msno
-# %matplotlib inline
-# msno.matrix(collisions.sample(250))
-# (collisions.sample(250)).head()
-# msno.matrix(pd.concat([data, target], axis=1))
-
-#### 2) **Feature selection**
-
-#### 3) **Feature engineering**
 
 #%%
 # Optimise hyperparameters
@@ -112,8 +91,6 @@ def objective(trial, data=data, target=target, objective_type=objective_type, ev
         param,
         dtrain,
         num_boost_round=num_boost_round,
-        # See https://stackoverflow.com/questions/54709800/why-cant-i-match-lgbms-cv-score
-        # folds = None # Use folds parameters to control how data is split and use if for shap later on
         nfold=nfold,
         stratified=stratified,
         shuffle=True, # Default
@@ -261,16 +238,3 @@ for i, trial_number in enumerate(study_df["number"]):
             df.index = trial_cvbooster.feature_name()[0]
             df.to_csv(f"trial_{trial_number}_{j}.csv")
         
-# %%
-
-import shap
-# Using SHAP with Cross-Validation in Python - https://towardsdatascience.com/using-shap-with-cross-validation-d24af548fadc
-# Sample input data
-X_sample = data #X_test.iloc[:100]  # Replace with your actual data
-trial_results = joblib.load(f"trial_results_{trial_number}.pkl")
-boosters = trial_results["cvbooster"].boosters
-# Loop through each booster and calculate SHAP values
-for booster in boosters:
-    explainer = shap.TreeExplainer(booster)
-    shap_values = explainer.shap_values(X_sample)
-    shap.summary_plot(shap_values, X_sample, max_display=30)
