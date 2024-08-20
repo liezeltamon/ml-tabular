@@ -3,15 +3,19 @@
 #%%
 import lightgbm as lgb
 import matplotlib.pyplot as plt
+from matplotlib.backends.backend_pdf import PdfPages
 import numpy as np
 import optuna
 from optuna.visualization import plot_optimization_history, plot_param_importances, plot_slice, plot_timeline, plot_rank
 import pandas as pd
 from plotnine import ggplot, geom_point, aes, theme_classic, labs
+import shap
 from sklearn.datasets import load_breast_cancer, load_diabetes
 from sklearn.dummy import DummyRegressor, DummyClassifier
 from sklego.dummy import RandomRegressor
 from sklearn.metrics import mean_squared_error, roc_auc_score
+from sklearn.model_selection import KFold
+#from statistics import mean, median
 import joblib, json, yaml
 
 #%%
@@ -29,9 +33,8 @@ num_cores = int(config["general"]["num_cores"])
 num_boost_round = int(config["predict"]["num_boost_round"])
 nfold = int(config["predict"]["nfold"])
 test = config["general"]["test"]
-
-data_path = "../data/data.feather"
-target_path = "../data/target.feather"
+data_path = config["general"]["data_path"]
+target_path = config["general"]["target_path"]
 
 #%%
 # Load data
@@ -62,16 +65,18 @@ print("Missing values in target:")
 print(target_missing[target_missing > 0])
 
 #%%
+# Cross-validation folds
+folds = KFold(nfold, random_state=random_state, shuffle=True)
+
+#%%
 # Optimise hyperparameters
 
-def objective(trial, data=data, target=target, objective_type=objective_type, eval_metric=eval_metric, num_boost_round=num_boost_round, nfold=nfold, random_state=random_state):
-
-    # Should be inside the objective function to not get this error:
-    # LightGBMError: Reducing `min_data_in_leaf` with `feature_pre_filter=true` may cause unexpected behaviour for features that were pre-filtered by the larger `min_data_in_leaf`.
-    dtrain = lgb.Dataset(data, label=target)
+def objective(trial, data=data, target=target, objective_type=objective_type, eval_metric=eval_metric, num_boost_round=num_boost_round, folds=folds, random_state=random_state, opt_direction=opt_direction):
 
     if objective_type == "regression":
         stratified = False # Default is lightgbm.cv(stratified=True)
+    elif objective_type in ["binary", "multiclass"]:
+        stratified = True
 
     param = {
         "objective": objective_type,
@@ -87,14 +92,17 @@ def objective(trial, data=data, target=target, objective_type=objective_type, ev
         "min_child_samples": trial.suggest_int("min_child_samples", 5, 100),
     }
 
+    # Should be inside the objective function to not get this error:
+    # LightGBMError: Reducing `min_data_in_leaf` with `feature_pre_filter=true` may cause unexpected behaviour for features that were pre-filtered by the larger `min_data_in_leaf`.
+    dtrain = lgb.Dataset(data, label=target)
+
     trial_results = lgb.cv(
         param,
         dtrain,
         num_boost_round=num_boost_round,
-        nfold=nfold,
+        folds=folds,
         stratified=stratified,
         shuffle=True, # Default
-        seed=random_state,
         eval_train_metric=True,
         return_cvbooster=True,
     )
@@ -106,19 +114,24 @@ def objective(trial, data=data, target=target, objective_type=objective_type, ev
     with open(f"trial_params_{trial.number}.json", "w") as f:
         json.dump(trial_results["cvbooster"].boosters[0].params, f, indent=4)
     
-    return max(trial_results["valid " + eval_metric + "-mean"])
+    if opt_direction == "minimize":
+        return min(trial_results["valid " + eval_metric + "-mean"])
+    elif opt_direction == "maximize":
+        return max(trial_results["valid " + eval_metric + "-mean"])
 #
 #%%
 # if __name__ == "__main__":
 study = optuna.create_study(direction=opt_direction) # optuna.create_study(pruner=None) by default i.e. MedianPruner is used
 study.optimize(objective, n_trials=opt_n_trials, n_jobs = num_cores)
-############################################################################################################
+
 #%%
 # Assess whether you need to repeat optimisation or not
 
 study_df = study.trials_dataframe()
 if opt_direction == "minimize":
     sort_direction = True
+elif opt_direction == "maximize":
+    sort_direction = False
 study_df.sort_values("value", ascending=sort_direction, inplace=True)
 study_df.to_csv("trials_study.csv", index=False)
 study_df["number"] = pd.Categorical(study_df["number"], categories=study_df['number'].unique(), ordered=True)
@@ -226,6 +239,9 @@ fig.write_image("plot_timeline.pdf", height = 3*300, width = 4*300, engine="kale
 # Save both split and gain from each trial so you can decide how to rank all features
 # Get ave split and gain for each feature across all trials and folds
 # then plot split x gain
+
+folds_split_list = list(folds.split(data))
+
 for i, trial_number in enumerate(study_df["number"]):
     trial_results = joblib.load(f"trial_results_{trial_number}.pkl")
     trial_cvbooster = trial_results["cvbooster"]
@@ -237,4 +253,96 @@ for i, trial_number in enumerate(study_df["number"]):
             df = pd.DataFrame(trial_cvbooster.feature_importance(importance_type=j)).T
             df.index = trial_cvbooster.feature_name()[0]
             df.to_csv(f"trial_{trial_number}_{j}.csv")
+
+# %%
+# Feature importance with shap values
+
+with PdfPages('shap_beeswarm_plots.pdf') as pdf:
+
+   fig, axes = plt.subplots(1, nfold, figsize=(20 * nfold, 5))
+   plot_count = 0
+
+   for i, trial_number in enumerate(study_df["number"]):
+        # Using SHAP with Cross-Validation in Python - https://towardsdatascience.com/using-shap-with-cross-validation-d24af548fadc
+        trial_results = joblib.load(f"trial_results_{trial_number}.pkl")
+        boosters = trial_results["cvbooster"].boosters
+
+        ave_shap_feature_list = []
+        for j in range(nfold):
+            explainer = shap.TreeExplainer(boosters[j])
+            valid_inds = folds_split_list[j][1]
+            explain_on_data = data.iloc[valid_inds, :] #data
         
+            explainer_values = explainer(explain_on_data)
+            shap_values = explainer_values.values # Same as shap_values = explainer.shap_values(explain_on_data)
+            ave_shap_feature = np.mean(np.abs(shap_values), axis=0)
+            ave_shap_feature_list.append(ave_shap_feature)
+
+            #shap.plots.bar(explainer_values, max_display=30)
+            shap.plots.beeswarm(explainer_values, max_display=30, show=False) #shap.summary_plot(shap_values, explain_on_data, max_display=30)
+            f = plt.gcf()
+            #shap_values_arr = np.hstack((explainer_values.values,
+            #                             explainer_values.base_values.reshape(-1, 1)))
+            #explainer_values.values.shape
+            #explainer_values.base_values.shape
+
+            plot_count += 1
+
+            # Save the figure to the PDF every 3 plots
+            if plot_count % nfold == 0:
+                pdf.savefig(fig)
+                plt.clf()
+                fig, axes = plt.subplots(1, nfold, figsize=(20* nfold, 5))
+   
+   df = pd.DataFrame(ave_shap_feature_list).T
+   df.index = boosters[j].feature_name()
+   df.to_csv(f"trial_{trial_number}_shap.csv")
+
+# %% 
+# For testing
+with PdfPages('shap_beeswarm_plots.pdf') as pdf:
+
+    fig, axes = plt.subplots(1, nfold, figsize=(20 * nfold, 5))
+    plot_count = 0
+
+    for i, trial_number in enumerate(study_df["number"].iloc[0:2]):
+        # Load trial results
+        trial_results = joblib.load(f"trial_results_{trial_number}.pkl")
+        boosters = trial_results["cvbooster"].boosters
+
+        ave_shap_feature_list = []
+        fig, axes = plt.subplots(1, nfold, figsize=(20 * nfold, 5))
+        plot_count = 0
+
+        for j in range(nfold):
+            explainer = shap.TreeExplainer(boosters[j])
+            valid_inds = folds_split_list[j][1]
+            explain_on_data = data.iloc[valid_inds, :]  # Data for the current fold
+            
+            explainer_values = explainer(explain_on_data)
+            shap_values = explainer_values.values  # SHAP values
+            ave_shap_feature = np.mean(np.abs(shap_values), axis=0)
+            ave_shap_feature_list.append(ave_shap_feature)
+
+            # Generate the beeswarm plot
+            plt.sca(axes[plot_count % nfold])  # Set the current axis
+            shap.plots.beeswarm(explainer_values, max_display=30, show=False)
+            
+            plot_count += 1
+
+            # Save the figure to the PDF every 3 plots
+            if plot_count % nfold == 0:
+                pdf.savefig(fig)
+                plt.clf()
+                fig, axes = plt.subplots(1, nfold, figsize=(20* nfold, 5))
+
+        # Save any remaining plots
+        if plot_count % nfold != 0:
+            pdf.savefig(fig)
+            plt.clf()
+
+    df = pd.DataFrame(ave_shap_feature_list).T
+    df.index = boosters[j].feature_name()
+    df.to_csv(f"trial_{trial_number}_shap.csv")
+
+# %%
