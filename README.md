@@ -42,7 +42,7 @@ The following are generated per optimisation trial
 - Plots to assess Optuna optimisation and to show learnings on relationship between features and performance during optimisation
 
 - CSV of importance metrics for all features
-  + 3 metrics: [shap](https://www.nature.com/articles/s42256-019-0138-9.epdf?shared_access_token=RCYPTVkiECUmc0CccSMgXtRgN0jAjWel9jnR3ZoTv0O81kV8DqPb2VXSseRmof0Pl8YSOZy4FHz5vMc3xsxcX6uT10EzEoWo7B-nZQAHJJvBYhQJTT1LnJmpsa48nlgUWrMkThFrEIvZstjQ7Xdc5g%3D%3D), lightGBM split and gain
+  + 3 metrics: [shap](https://www.nature.com/articles/s42256-019-0138-9), lightGBM split and gain
 
 - Plots showing most important features
 
