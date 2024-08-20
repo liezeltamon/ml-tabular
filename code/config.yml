@@ -1,8 +1,10 @@
 general:
+  data_path: "../data/data.feather"
+  target_path: "../data/target.feather"
   random_state: 290
   eval_metric: "rmse"
   objective_type: "regression"
-  test: true
+  test: false
   num_cores: 1
 
 optimise:
@@ -15,3 +17,4 @@ predict:
 
 plot:
   plot_n_trials: null
+  plot_n_importance: 150

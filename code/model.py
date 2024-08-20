@@ -4,18 +4,18 @@
 import lightgbm as lgb
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
+from math import ceil, floor
 import numpy as np
 import optuna
 from optuna.visualization import plot_optimization_history, plot_param_importances, plot_slice, plot_timeline, plot_rank
 import pandas as pd
-from plotnine import ggplot, geom_point, aes, theme_classic, labs
+from plotnine import ggplot, geom_point, aes, theme_classic, labs, geom_col, coord_flip, facet_wrap, scale_y_continuous
 import shap
 from sklearn.datasets import load_breast_cancer, load_diabetes
 from sklearn.dummy import DummyRegressor, DummyClassifier
 from sklego.dummy import RandomRegressor
 from sklearn.metrics import mean_squared_error, roc_auc_score
 from sklearn.model_selection import KFold
-#from statistics import mean, median
 import joblib, json, yaml
 
 #%%
@@ -29,6 +29,7 @@ objective_type = config["general"]["objective_type"]
 opt_direction = config["optimise"]["opt_direction"]
 opt_n_trials = int(config["optimise"]["opt_n_trials"])
 plot_n_trials = config["plot"]["plot_n_trials"] # If None, plot all trials
+plot_n_importance = config["plot"]["plot_n_importance"]
 num_cores = int(config["general"]["num_cores"])
 num_boost_round = int(config["predict"]["num_boost_round"])
 nfold = int(config["predict"]["nfold"])
@@ -110,8 +111,8 @@ def objective(trial, data=data, target=target, objective_type=objective_type, ev
     trial.set_user_attr("trial_results", trial_results)
     
     # Save the trial results and parameters
-    joblib.dump(trial_results, f"trial_results_{trial.number}.pkl")
-    with open(f"trial_params_{trial.number}.json", "w") as f:
+    joblib.dump(trial_results, f"trial_{trial.number}_results.pkl")
+    with open(f"trial_{trial.number}_params.json", "w") as f:
         json.dump(trial_results["cvbooster"].boosters[0].params, f, indent=4)
     
     if opt_direction == "minimize":
@@ -155,8 +156,6 @@ elif objective_type in ["binary", "multiclass"]:
         naive_target = DummyClassifier(strategy=strat).fit(data, target).predict_proba(data)[:,1]
         naive_values_dict[strat] = roc_auc_score(target, naive_target)
 
-#naive_metrics = {strat: np.full(num_boost_round, naive_value).tolist() for strat, naive_value in naive_values_dict.items()}
-
 #%%
 ### 1) Plot showing rank of trials
 
@@ -194,7 +193,7 @@ max_eval_metric = np.max(minmax_array)
 line_styles = {"mean": "--", "median": "-.", "uniform": ":", "normal": "-", "stratified": "--", "most_frequent": "-."}
 
 for i, trial_number in enumerate(study_df["number"]):
-    #trial_results = joblib.load(f"trial_results_{trial_number}.pkl")
+    #trial_results = joblib.load(f"trial_{trial_number}_results.pkl")
     trial_results = study.trials[int(trial_number)].user_attrs["trial_results"]
     train_metrics = trial_results["train " + eval_metric + "-mean"]
     valid_metrics = trial_results["valid " + eval_metric + "-mean"]
@@ -235,114 +234,91 @@ fig.write_image("plot_rank.pdf", height = 3*300, width = 12*300, engine="kaleido
 fig = plot_timeline(study)
 fig.write_image("plot_timeline.pdf", height = 3*300, width = 4*300, engine="kaleido")
 
-#%% 
-# Save both split and gain from each trial so you can decide how to rank all features
-# Get ave split and gain for each feature across all trials and folds
-# then plot split x gain
+# %%
+# Feature importance and SHAP values
 
 folds_split_list = list(folds.split(data))
 
 for i, trial_number in enumerate(study_df["number"]):
-    trial_results = joblib.load(f"trial_results_{trial_number}.pkl")
-    trial_cvbooster = trial_results["cvbooster"]
+    # Using SHAP with Cross-Validation in Python - https://towardsdatascience.com/using-shap-with-cross-validation-d24af548fadc
+    trial_results = joblib.load(f"trial_{trial_number}_results.pkl")
     
+    # gain and split
+    gain_split_df_list = []
+    trial_cvbooster = trial_results["cvbooster"]
     if not all([trial_cvbooster.feature_name()[0] == i for i in trial_cvbooster.feature_name()]):
         raise ValueError(f"Trial number {trial_number}: Feature names are not the same across all folds")
     else:
         for j in ["gain", "split"]:
             df = pd.DataFrame(trial_cvbooster.feature_importance(importance_type=j)).T
             df.index = trial_cvbooster.feature_name()[0]
+            gain_split_df_list.append(df)
             df.to_csv(f"trial_{trial_number}_{j}.csv")
 
-# %%
-# Feature importance with shap values
+            tidy_df = pd.melt(df.reset_index(), id_vars=["index"], var_name="fold", value_name="value")
+            tidy_df.sort_values("value", ascending=False, inplace=True)
+            tidy_df.reset_index(drop=True, inplace=True)
+            tidy_df['index'] = pd.Categorical(tidy_df['index'], categories=tidy_df['index'].unique()[::-1], ordered=True)
+            tidy_df = tidy_df.iloc[1:plot_n_importance,:]
+            max_value = float(tidy_df["value"].max())
+            p = (ggplot(tidy_df, aes(x="index", y="value"))
+                 + geom_col(colour = "white")
+                 #+ scale_y_continuous(limits=(0, max_value + (0.1 * max_value)))
+                 + labs(y = j, x = "Feature")
+                 + theme_classic()
+                 + facet_wrap("~fold", scales="free_x")
+                 + coord_flip()
+            )
+            p.save(f"trial_{trial_number}_plot_{j}.pdf", dpi=300, width=5 * nfold, height=ceil(plot_n_importance / 15))
 
-with PdfPages('shap_beeswarm_plots.pdf') as pdf:
+    # shap
+    boosters = trial_results["cvbooster"].boosters
+    ave_shap_feature_list = []
+    fig, axes = plt.subplots(1, nfold)
+    plot_count = 0
 
-   fig, axes = plt.subplots(1, nfold, figsize=(20 * nfold, 5))
-   plot_count = 0
-
-   for i, trial_number in enumerate(study_df["number"]):
-        # Using SHAP with Cross-Validation in Python - https://towardsdatascience.com/using-shap-with-cross-validation-d24af548fadc
-        trial_results = joblib.load(f"trial_results_{trial_number}.pkl")
-        boosters = trial_results["cvbooster"].boosters
-
-        ave_shap_feature_list = []
+    with PdfPages(f"trial_{trial_number}_plot_shap_beeswarm.pdf") as pdf:
         for j in range(nfold):
             explainer = shap.TreeExplainer(boosters[j])
             valid_inds = folds_split_list[j][1]
-            explain_on_data = data.iloc[valid_inds, :] #data
+            explain_on_data = data #data.iloc[valid_inds, :] #data
         
             explainer_values = explainer(explain_on_data)
             shap_values = explainer_values.values # Same as shap_values = explainer.shap_values(explain_on_data)
             ave_shap_feature = np.mean(np.abs(shap_values), axis=0)
             ave_shap_feature_list.append(ave_shap_feature)
 
-            #shap.plots.bar(explainer_values, max_display=30)
-            shap.plots.beeswarm(explainer_values, max_display=30, show=False) #shap.summary_plot(shap_values, explain_on_data, max_display=30)
-            f = plt.gcf()
-            #shap_values_arr = np.hstack((explainer_values.values,
-            #                             explainer_values.base_values.reshape(-1, 1)))
-            #explainer_values.values.shape
-            #explainer_values.base_values.shape
-
+            plt.sca(axes[plot_count % nfold])
+            shap.plots.beeswarm(explainer_values, max_display=floor(plot_n_importance / nfold), show=False)
+            plt.title(f"Trial {trial_number}, Fold {j}")
+    
             plot_count += 1
 
             # Save the figure to the PDF every 3 plots
             if plot_count % nfold == 0:
+                fig.set_size_inches(15 * nfold, 15)
                 pdf.savefig(fig)
                 plt.clf()
-                fig, axes = plt.subplots(1, nfold, figsize=(20* nfold, 5))
-   
-   df = pd.DataFrame(ave_shap_feature_list).T
-   df.index = boosters[j].feature_name()
-   df.to_csv(f"trial_{trial_number}_shap.csv")
-
-# %% 
-# For testing
-with PdfPages('shap_beeswarm_plots.pdf') as pdf:
-
-    fig, axes = plt.subplots(1, nfold, figsize=(20 * nfold, 5))
-    plot_count = 0
-
-    for i, trial_number in enumerate(study_df["number"].iloc[0:2]):
-        # Load trial results
-        trial_results = joblib.load(f"trial_results_{trial_number}.pkl")
-        boosters = trial_results["cvbooster"].boosters
-
-        ave_shap_feature_list = []
-        fig, axes = plt.subplots(1, nfold, figsize=(20 * nfold, 5))
-        plot_count = 0
-
-        for j in range(nfold):
-            explainer = shap.TreeExplainer(boosters[j])
-            valid_inds = folds_split_list[j][1]
-            explain_on_data = data.iloc[valid_inds, :]  # Data for the current fold
-            
-            explainer_values = explainer(explain_on_data)
-            shap_values = explainer_values.values  # SHAP values
-            ave_shap_feature = np.mean(np.abs(shap_values), axis=0)
-            ave_shap_feature_list.append(ave_shap_feature)
-
-            # Generate the beeswarm plot
-            plt.sca(axes[plot_count % nfold])  # Set the current axis
-            shap.plots.beeswarm(explainer_values, max_display=30, show=False)
-            
-            plot_count += 1
-
-            # Save the figure to the PDF every 3 plots
-            if plot_count % nfold == 0:
-                pdf.savefig(fig)
-                plt.clf()
-                fig, axes = plt.subplots(1, nfold, figsize=(20* nfold, 5))
-
-        # Save any remaining plots
-        if plot_count % nfold != 0:
-            pdf.savefig(fig)
-            plt.clf()
+                fig, axes = plt.subplots(1, nfold)
 
     df = pd.DataFrame(ave_shap_feature_list).T
     df.index = boosters[j].feature_name()
     df.to_csv(f"trial_{trial_number}_shap.csv")
 
+    tidy_df = pd.melt(df.reset_index(), id_vars=["index"], var_name="fold", value_name="value")
+    tidy_df.sort_values("value", ascending=False, inplace=True)
+    tidy_df.reset_index(drop=True, inplace=True)
+    tidy_df['index'] = pd.Categorical(tidy_df['index'], categories=tidy_df['index'].unique()[::-1], ordered=True)
+    tidy_df = tidy_df.iloc[1:plot_n_importance,:]
+    #max_value = float(tidy_df["value"].max())
+    p = (ggplot(tidy_df, aes(x="index", y="value"))
+         + geom_col(colour = "white")
+         #+ scale_y_continuous(limits=(0, max_value + (0.1 * max_value)))
+         + labs(y = "mean(abs(shap|))", x = "Feature")
+         + theme_classic()
+         + facet_wrap("~fold", scales="free_x")
+         + coord_flip()
+    )
+    p.save(f"trial_{trial_number}_plot_shap.pdf", dpi=300, width=5 * nfold, height=ceil(plot_n_importance / 15))
+ 
 # %%
