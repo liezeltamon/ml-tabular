@@ -1,9 +1,10 @@
-# Create pipeline to seamlessly use ML at any step of bioinformatics workflow mainly for ranking 
-features
+# Workflow to seamlessly use ML on tabular data at certain steps of computational workflow mainly for ranking features
 
-- For my use case, features would mostly be genes/proteins and samples would be biological samples (bulk) or single-cells
+- Motivated by applying ML on single-cell data where features would would be genes and samples would be single-cells
  
-### Potential use cases
+# Use cases
+
+#### Computational biology
 
 - Predicting control vs. phenotype and identifying important features
   + This effectively selects features too reducing dimensionality and also identifies most important features with biological relevance (results can be compared with conventional methods for analysing data)
@@ -12,27 +13,39 @@ features
 - Integrating multi-omic or modal data to predict phenotypes
   + When different modalities of data/measurements are available e.g. RNA and proteins, this pipeline can be used to train and select features from each modality and then do another training after combining each modalities with reduced features
   
-# Method
+# Method (current implementation)
 
-- Use ML framework that allows me to easily switch between predicting continuous or categorical labels (and easily switch metric accordingly) by changing a parameter in the pipeline
-  + Considering LightGBM now over XGBoost for faster training times? Are there other frameworks that would be better for my purpose?
-  
-- optuna for automatic hyperparameter optimisation
+- ML framework: LightGBM
+  + Allows to easily switch between predicting continuous or categorical labels
+  + Faster than XGBoost
+
+- Automatic hyperparameter optimisation with optuna
   + Reduce spending time on hyperparameter optimisation
   + Set sensible ranges for optuna as defaults so user can focus on getting feature ranking
+  + Optuna does multiple optimisation trials using different hyperparameters and identifies best trial
 
 - Cross validation
-  + To make sure that the model is robust while using all of my data especially when data is small
-  + optuna has `optuna.integration.lightgbm.LightGBMTunerCV` so I guess this is possible when using LightGBM
+  + To identify robust model
+  + Increase robustness with feature importance metrics from multiple splits of data
 
 # Outputs
 
-- Panel of plots to assess model e.g. did not over or underfit
-  + Figure out how I can get from `lightgbm.cv` output the training and validation metrics from each iteration for each fold so plots can be created
-  + Figure out also how to assess optuna run
-  + Essentially create a panel of plots to assess whether you can trust the feature importance output or not or better to redo model training
+The following are generated per optimisation trial
 
-- Feature importance from each model for each fold
-  + Not sure yet if this is possible with `lightgbm.cv` or it only gives aggregated feature importances (as well as metrics?)
+- Plots to assess model e.g. did it overfit, underfit, need more iteration
+  + Assess whether you can trust the feature importance outputs or better to redo model training
 
-- Panel of plots showing feature importances
+- Pickle files of model per trial
+
+- Parameters (SJON) per trial
+
+- Plots to assess Optuna optimisation and to show learnings on relationship between features and performance during optimisation
+
+- CSV of importance metrics for all features
+  + 3 metrics: [shap](https://www.nature.com/articles/s42256-019-0138-9.epdf?shared_access_token=RCYPTVkiECUmc0CccSMgXtRgN0jAjWel9jnR3ZoTv0O81kV8DqPb2VXSseRmof0Pl8YSOZy4FHz5vMc3xsxcX6uT10EzEoWo7B-nZQAHJJvBYhQJTT1LnJmpsa48nlgUWrMkThFrEIvZstjQ7Xdc5g%3D%3D), lightGBM split and gain
+
+- Plots showing most important features
+
+# Sample data and outputs 
+
+[link](https://drive.google.com/drive/folders/1aV484DkANCy8A3veGe1DN0B3YUz7HwoP?usp=share_link)
