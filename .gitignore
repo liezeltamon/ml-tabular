@@ -36,4 +36,5 @@ z_ignore_git/
 !data-raw/README.md
 
 # Project-specific
+code/*.json
 tests/*.json
