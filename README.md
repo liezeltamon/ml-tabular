@@ -37,7 +37,7 @@ The following are generated per optimisation trial
 
 - Pickle files of model per trial
 
-- Parameters (SJON) per trial
+- Parameters (JSON) per trial
 
 - Plots to assess Optuna optimisation and to show learnings on relationship between features and performance during optimisation
 
