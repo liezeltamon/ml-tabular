@@ -269,7 +269,7 @@ for i, trial_number in enumerate(study_df["number"]):
                  + facet_wrap("~fold", scales="free_x")
                  + coord_flip()
             )
-            p.save(f"trial_{trial_number}_plot_{j}.pdf", dpi=300, width=5 * nfold, height=ceil(plot_n_importance / 15))
+            p.save(f"trial_{trial_number}_plot_{j}.pdf", dpi=300, width=3.5 * nfold, height=ceil(plot_n_importance / 12), limitsize=False)
 
     # shap
     boosters = trial_results["cvbooster"].boosters
