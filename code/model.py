@@ -1,4 +1,5 @@
 # LightGBM CV + Optuna for tabular data
+# python model.py > model.log.out 2> model.log.err
 
 #%%
 import lightgbm as lgb
@@ -7,6 +8,7 @@ from matplotlib.backends.backend_pdf import PdfPages
 from math import ceil, floor
 import numpy as np
 import optuna
+import joblib, json, yaml
 from optuna.visualization import plot_optimization_history, plot_param_importances, plot_slice, plot_timeline, plot_rank
 import pandas as pd
 from plotnine import ggplot, geom_point, aes, theme_classic, labs, geom_col, coord_flip, facet_wrap, scale_y_continuous
@@ -16,7 +18,7 @@ from sklearn.dummy import DummyRegressor, DummyClassifier
 from sklego.dummy import RandomRegressor
 from sklearn.metrics import mean_squared_error, roc_auc_score
 from sklearn.model_selection import KFold
-import joblib, json, yaml
+from sklearn.datasets import fetch_openml
 
 #%%
 # Parameters
@@ -34,6 +36,8 @@ num_cores = int(config["general"]["num_cores"])
 num_boost_round = int(config["predict"]["num_boost_round"])
 nfold = int(config["predict"]["nfold"])
 test = config["general"]["test"]
+mixed_type_features = config["general"]["mixed_type_features"]
+
 data_path = config["general"]["data_path"]
 target_path = config["general"]["target_path"]
 
@@ -41,6 +45,16 @@ target_path = config["general"]["target_path"]
 # Load data
 if test and objective_type in ["binary", "multiclass"]:
     data, target = load_breast_cancer(return_X_y=True, as_frame=True)
+elif test and objective_type == "binary" and mixed_type_features == True:
+    # Load dataset with mixed numeric + categorical features
+    adult = fetch_openml("adult", version=2, as_frame=True)
+    data = adult.data
+    target = adult.target
+    # Make categorical columns explicit (LightGBM can use them as categories)
+    for col in data.select_dtypes(include="object").columns:
+        data[col] = data[col].astype("category")
+    ## Make labels numeric 0/1 for LightGBM binary objective
+    target = (target == ">50K").astype(int)
 elif test and objective_type == "regression":
     data, target = load_diabetes(return_X_y=True, as_frame=True)
 elif not test:

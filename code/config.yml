@@ -2,13 +2,14 @@ general:
   data_path: "../data/data.feather"
   target_path: "../data/target.feather"
   random_state: 290
-  eval_metric: "rmse"
-  objective_type: "regression"
-  test: false
+  eval_metric: "auc"
+  objective_type: "binary"
+  test: true
+  mixed_type_features: true
   num_cores: 1
 
 optimise:
-  opt_direction: "minimize"
+  opt_direction: "maximize"
   opt_n_trials: 10
 
 predict:
