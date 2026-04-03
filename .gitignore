@@ -32,6 +32,7 @@ data-raw/
 *_files
 *_cache
 z_ignore_git/
+.codex/
 
 !data-raw/README.md
 
