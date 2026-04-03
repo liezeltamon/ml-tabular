@@ -1,18 +1,11 @@
 # Environments
 
-## Contents
-- Environment-related files needed for project, for example conda environment YAML files and notes on how to recreate environments
+#### `ml-tabular-env`
 
-## `ml-tabular-env`
-
-Environment created with:
+Environment can be created with:
 
 ```bash
-mamba create -n ml-tabular-env python=3.12
-mamba activate ml-tabular-env
-pip install "flaml[automl]"
-pip install lazypredict[boost]
-pip install mlflow optuna
+bash envs/ml-tabular-env.sh
 ```
 
 Why not `lazypredict[all]`?
