@@ -1,5 +1,7 @@
+# OS files
 *.DS_Store
 
+# R artifacts
 *.Rhistory
 *.Rapp.history
 *.Rproj.user
@@ -8,18 +10,22 @@
 *.rds
 *.qs
 
+# Python artifacts
 __pycache__/
 *.py[cod]
 *.pkl
 
+# Rendered markdown outputs
 *.utf8.md
 *.knit.md
 
+# Logs
 *.log
 *.log.out
 *.log.err
 sps-*
 
+# Generated analysis outputs
 *.csv
 *.tar
 *.gz
@@ -28,14 +34,20 @@ sps-*
 *.png
 *.xlsx
 
+# Local data and scratch directories
 data-raw/
 *_files
 *_cache
 z_ignore_git/
-.codex/
+.codex
+results/
 
+# Keep tracked docs in ignored directories
 !data-raw/README.md
 
-# Project-specific
-code/*.json
-tests/*.json
+# MLflow tracking files
+mlflow.db
+mlruns/
+
+# Project-specific generated files
+code/catboost_info/
