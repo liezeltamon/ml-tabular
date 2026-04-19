@@ -1,4 +1,6 @@
 # %% Benchmark model architectures
+# env: ml-tabular-env
+#sbatch -J benchmark_models -p short,long --mem=50G --output=%x.log.out --error=%x.log.err --wrap="python benchmark_models.py"
 
 import os
 import pandas as pd
@@ -8,6 +10,7 @@ from lazypredict.Supervised import LazyClassifier
 # %% Parameters
 
 benchmark_method = "lazypredict"  # "lazypredict" or "flaml"
+lazypredict_sorter_key = "ROC AUC"  # "Accuracy", "Balanced Accuracy", "ROC AUC", "F1 Score", "Time Taken"
 target_column = "label"
 
 train_path = "../data/train.csv"
@@ -20,8 +23,8 @@ os.makedirs(out_dir, exist_ok=True)
 
 # %% Load data
 
-train_df = pd.read_csv(train_path)
-test_df = pd.read_csv(test_path)
+train_df = pd.read_csv(train_path, index_col=0)
+test_df = pd.read_csv(test_path, index_col=0)
 
 X_train = train_df.drop(columns=[target_column])
 y_train = train_df[target_column]
@@ -34,6 +37,9 @@ y_test = test_df[target_column]
 if benchmark_method == "lazypredict":
     clf = LazyClassifier(verbose=0, ignore_warnings=True, custom_metric=None)
     models, predictions = clf.fit(X_train, X_test, y_train, y_test)
+
+    models = models.sort_values(by="ROC AUC", ascending=False)
+    models = models.sort_values(by=lazypredict_sorter_key, ascending=False)
 
     print(models)
     models.reset_index().to_csv(
