@@ -1,4 +1,5 @@
 # %% Tune shortlisted models and save the final pipeline
+# sbatch -J tune_models -p long --mem=200G --output=%x.log.out --error=%x.log.err --wrap="python tune_models.py"
 
 import joblib
 import os
@@ -29,26 +30,65 @@ test_size = 0.2
 cv_folds = 5
 optuna_n_trials = 30
 scoring_metric = "roc_auc"
-mlflow_experiment_name = "tabular_model_selection"
-out_dir = "../results/tune_models"
+mlflow_experiment_name = "cytof_annotation"
+out_dir = "../results/tune_models/cytof_annotation"
 os.makedirs(out_dir, exist_ok=True)
+train_path = "../data/train.csv"
+test_path = "../data/test.csv"
+target_column = "label"
 
 # Set to False if preprocessing can produce a sparse matrix, for example after one-hot encoding.
 stdscaler_with_mean = True
 
+top_models_to_tune = [
+    "LogisticRegression",
+    #"LinearSVC",
+    #"SVC",
+    #"XGBClassifier",
+    "LGBMClassifier",
+    "CatBoostClassifier",
+]
+
+MODEL_NAME_MAP = {
+    "LogisticRegression": "logreg",
+    "LinearSVC": "linearsvc",
+    "SVC": "svc",
+    "XGBClassifier": "xgb",
+    "LGBMClassifier": "lgbm",
+    "CatBoostClassifier": "catboost",
+}
+
 # %% Prepare data
 
-data = load_breast_cancer(as_frame=True)
-X = data.data
-y = data.target
+if train_path is None and test_path is None:
+    data_source = "breast_cancer_debug"
+    data = load_breast_cancer(as_frame=True)
+    X = data.data
+    y = data.target
 
-X_train, X_test, y_train, y_test = train_test_split(
-    X,
-    y,
-    test_size=test_size,
-    random_state=random_state,
-    stratify=y,
-)
+    X_train, X_test, y_train, y_test = train_test_split(
+        X,
+        y,
+        test_size=test_size,
+        random_state=random_state,
+        stratify=y,
+    )
+elif train_path is not None and test_path is not None:
+    data_source = "external_csv"
+    train_df = pd.read_csv(train_path, index_col=0)
+    test_df = pd.read_csv(test_path, index_col=0)
+
+    if target_column not in train_df.columns:
+        raise ValueError(f"target_column '{target_column}' not found in train data")
+    if target_column not in test_df.columns:
+        raise ValueError(f"target_column '{target_column}' not found in test data")
+
+    X_train = train_df.drop(columns=[target_column])
+    y_train = train_df[target_column]
+    X_test = test_df.drop(columns=[target_column])
+    y_test = test_df[target_column]
+else:
+    raise ValueError("train_path and test_path must either both be set or both be None")
 
 numeric_cols = X_train.select_dtypes(include=["number"]).columns.tolist()
 categorical_cols = X_train.select_dtypes(exclude=["number"]).columns.tolist()
@@ -72,25 +112,6 @@ preprocessor = ColumnTransformer(
 )
 
 cv = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=random_state)
-
-top_models_to_tune = [
-    "LogisticRegression",
-    "LinearSVC",
-    "SVC",
-    "XGBClassifier",
-    "LGBMClassifier",
-    "CatBoostClassifier",
-]
-
-MODEL_NAME_MAP = {
-    "LogisticRegression": "logreg",
-    "LinearSVC": "linearsvc",
-    "SVC": "svc",
-    "XGBClassifier": "xgb",
-    "LGBMClassifier": "lgbm",
-    "CatBoostClassifier": "catboost",
-}
-
 
 def build_pipeline(trial, model_name):
     if model_name == "logreg":
@@ -195,6 +216,14 @@ class FixedTrial:
 
     def suggest_categorical(self, name, choices):
         return self.params[name]
+
+
+def log_data_source_params():
+    mlflow.log_param("data_source", data_source)
+    if data_source == "external_csv":
+        mlflow.log_param("train_path", train_path)
+        mlflow.log_param("test_path", test_path)
+        mlflow.log_param("target_column", target_column)
 
 
 def compute_score(model, X, y, scoring_metric, num_classes):
@@ -348,6 +377,7 @@ for lazy_name in top_models_to_tune:
     model_name = MODEL_NAME_MAP[lazy_name]
 
     with mlflow.start_run(run_name=f"optuna_{model_name}"):
+        log_data_source_params()
         mlflow.log_param("model_family", model_name)
         mlflow.log_param("lazy_name", lazy_name)
         mlflow.log_param("cv_folds", cv.get_n_splits())
@@ -390,6 +420,7 @@ plot_cv_score_spread(
 )
 
 with mlflow.start_run(run_name="model_comparison_summary"):
+    log_data_source_params()
     mlflow.log_artifact("optuna_model_comparison.csv")
     mlflow.log_artifact(os.path.join(out_dir, "plot_model_comparison.png"))
     mlflow.log_artifact(os.path.join(out_dir, "plot_cv_score_spread.png"))
@@ -432,6 +463,7 @@ plot_final_model_scores(
 )
 
 with mlflow.start_run(run_name="final_model"):
+    log_data_source_params()
     mlflow.log_param("winning_model_family", best_model_name)
     mlflow.log_param("winning_lazy_name", best_lazy_name)
     mlflow.log_metric("best_score", best_study.best_value)
