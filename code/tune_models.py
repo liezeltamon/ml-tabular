@@ -12,12 +12,13 @@ import pandas as pd
 
 from catboost import CatBoostClassifier
 from lightgbm import LGBMClassifier
+from sklearn.calibration import CalibratedClassifierCV
 from sklearn.compose import ColumnTransformer
 from sklearn.datasets import load_breast_cancer
 from sklearn.ensemble import ExtraTreesClassifier, RandomForestClassifier
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import accuracy_score, roc_auc_score
+from sklearn.metrics import accuracy_score, log_loss, roc_auc_score
 from sklearn.model_selection import StratifiedKFold, cross_val_score, train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
@@ -261,6 +262,11 @@ def log_data_source_params():
         mlflow.log_param("target_column", target_column)
 
 
+def log_metric_if_valid(name, value):
+    if not np.isnan(value):
+        mlflow.log_metric(name, float(value))
+
+
 def compute_score(model, X, y, scoring_metric, num_classes):
     if scoring_metric in {"roc_auc", "roc_auc_ovr", "roc_auc_ovo"} and hasattr(
         model, "predict_proba"
@@ -352,31 +358,141 @@ def plot_cv_score_spread(results_df, scoring_metric, out_path):
 
 def plot_final_model_scores(
     best_model_name,
-    train_score,
-    cv_score,
-    test_score,
+    selection_cv_score,
+    uncalibrated_test_score,
+    calibrated_test_score,
     scoring_metric,
     out_path,
 ):
     score_summary_df = pd.DataFrame(
         {
-            "dataset": ["train", "cv", "test"],
-            "score": [train_score, cv_score, test_score],
+            "dataset": [
+                "selection_cv",
+                "uncalibrated_test",
+                "calibrated_test",
+            ],
+            "score": [
+                selection_cv_score,
+                uncalibrated_test_score,
+                calibrated_test_score,
+            ],
         }
     )
 
-    fig, ax = plt.subplots(figsize=(6, 5))
+    fig, ax = plt.subplots(figsize=(8, 5))
     ax.bar(
         score_summary_df["dataset"],
         score_summary_df["score"],
         color=["#4C78A8", "#F58518", "#54A24B"],
     )
     ax.set_ylabel(f"Score: {scoring_metric}")
-    ax.set_title(f"Generalization check for {best_model_name}")
+    ax.set_title(f"Selection vs held-out performance for {best_model_name}")
+    ax.tick_params(axis="x", rotation=20)
 
     for i, value in enumerate(score_summary_df["score"]):
         if not np.isnan(value):
             ax.text(i, value, f"{value:.3f}", ha="center", va="bottom")
+
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=300)
+    plt.close(fig)
+
+
+def summarise_calibration(model, X, y, scoring_metric, num_classes, bin_edges, thresholds):
+    y_series = pd.Series(y).reset_index(drop=True)
+    proba = model.predict_proba(X)
+    pred = pd.Series(model.predict(X))
+    confidence = proba.max(axis=1)
+    correct = (pred.values == y_series.values).astype(float)
+
+    score_value = compute_score(
+        model,
+        X,
+        y,
+        scoring_metric=scoring_metric,
+        num_classes=num_classes,
+    )
+    log_loss_value = log_loss(y_series, proba, labels=list(model.classes_))
+
+    bin_ids = np.digitize(confidence, bin_edges[1:-1], right=False)
+    bin_rows = []
+    ece = 0.0
+
+    for bin_idx in range(len(bin_edges) - 1):
+        mask = bin_ids == bin_idx
+        count = int(mask.sum())
+
+        if count == 0:
+            mean_confidence = np.nan
+            empirical_accuracy = np.nan
+        else:
+            mean_confidence = float(confidence[mask].mean())
+            empirical_accuracy = float(correct[mask].mean())
+            ece += (count / len(y_series)) * abs(empirical_accuracy - mean_confidence)
+
+        bin_rows.append(
+            {
+                "bin_lower": float(bin_edges[bin_idx]),
+                "bin_upper": float(bin_edges[bin_idx + 1]),
+                "count": count,
+                "mean_confidence": mean_confidence,
+                "empirical_accuracy": empirical_accuracy,
+            }
+        )
+
+    threshold_rows = []
+    for threshold in thresholds:
+        mask = confidence >= threshold
+        retained_count = int(mask.sum())
+        retained_fraction = retained_count / len(y_series)
+        retained_accuracy = float(correct[mask].mean()) if retained_count else np.nan
+        threshold_rows.append(
+            {
+                "threshold": float(threshold),
+                "retained_count": retained_count,
+                "retained_fraction": float(retained_fraction),
+                "retained_accuracy": retained_accuracy,
+            }
+        )
+
+    summary = {
+        "score": float(score_value) if not np.isnan(score_value) else np.nan,
+        "log_loss": float(log_loss_value),
+        "ece": float(ece),
+    }
+
+    return (
+        summary,
+        pd.DataFrame(bin_rows),
+        pd.DataFrame(threshold_rows),
+    )
+
+
+def plot_reliability_comparison(calibration_bins_df, out_path):
+    fig, ax = plt.subplots(figsize=(6, 6))
+    colors = {"uncalibrated": "#F58518", "calibrated": "#54A24B"}
+
+    for model_version, group in calibration_bins_df.groupby("model_version"):
+        plot_df = group.dropna(subset=["mean_confidence", "empirical_accuracy"])
+        if plot_df.empty:
+            continue
+
+        ax.plot(
+            plot_df["mean_confidence"],
+            plot_df["empirical_accuracy"],
+            marker="o",
+            linewidth=2,
+            label=model_version,
+            color=colors.get(model_version, "steelblue"),
+        )
+
+    ax.plot([0, 1], [0, 1], linestyle="--", color="black", linewidth=1)
+    ax.set_xlabel("Mean predicted confidence")
+    ax.set_ylabel("Empirical accuracy")
+    ax.set_title("Reliability comparison on held-out test data")
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.legend()
 
     fig.tight_layout()
     fig.savefig(out_path, dpi=300)
@@ -470,54 +586,148 @@ best_lazy_name = results_df.iloc[0]["lazy_name"]
 best_study = studies[best_model_name]
 num_classes = len(np.unique(y_train))
 
-final_pipeline = build_pipeline(FixedTrial(best_study.best_params), best_model_name)
-final_pipeline.fit(X_train, y_train)
+uncalibrated_final_pipeline = build_pipeline(
+    FixedTrial(best_study.best_params), best_model_name
+)
+uncalibrated_final_pipeline.fit(X_train, y_train)
 
-train_score = compute_score(
-    final_pipeline,
-    X_train,
-    y_train,
+best_pipeline = build_pipeline(FixedTrial(best_study.best_params), best_model_name)
+calibrated_model = CalibratedClassifierCV(
+    estimator=best_pipeline,
+    method="sigmoid",
+    cv=cv,
+    ensemble=False,
+)
+calibrated_model.fit(X_train, y_train)
+
+selection_cv_score = float(best_study.best_value)
+uncalibrated_test_score = compute_score(
+    uncalibrated_final_pipeline,
+    X_test,
+    y_test,
     scoring_metric=scoring_metric,
     num_classes=num_classes,
 )
-
-test_score = compute_score(
-    final_pipeline,
+calibrated_test_score = compute_score(
+    calibrated_model,
     X_test,
     y_test,
     scoring_metric=scoring_metric,
     num_classes=num_classes,
 )
 
-joblib.dump(final_pipeline, "final_model.pkl")
+bin_edges = np.linspace(0.0, 1.0, 11)
+confidence_thresholds = [0.50, 0.60, 0.70, 0.80, 0.90, 0.95]
+
+uncalibrated_summary, uncalibrated_bins_df, uncalibrated_thresholds_df = (
+    summarise_calibration(
+        uncalibrated_final_pipeline,
+        X_test,
+        y_test,
+        scoring_metric=scoring_metric,
+        num_classes=num_classes,
+        bin_edges=bin_edges,
+        thresholds=confidence_thresholds,
+    )
+)
+calibrated_summary, calibrated_bins_df, calibrated_thresholds_df = summarise_calibration(
+    calibrated_model,
+    X_test,
+    y_test,
+    scoring_metric=scoring_metric,
+    num_classes=num_classes,
+    bin_edges=bin_edges,
+    thresholds=confidence_thresholds,
+)
+
+calibration_comparison_df = pd.DataFrame(
+    [
+        {
+            "model_version": "uncalibrated",
+            "selection_cv_score": selection_cv_score,
+            "test_score": uncalibrated_summary["score"],
+            "log_loss": uncalibrated_summary["log_loss"],
+            "ece": uncalibrated_summary["ece"],
+        },
+        {
+            "model_version": "calibrated",
+            "selection_cv_score": selection_cv_score,
+            "test_score": calibrated_summary["score"],
+            "log_loss": calibrated_summary["log_loss"],
+            "ece": calibrated_summary["ece"],
+        },
+    ]
+)
+
+calibration_bins_df = pd.concat(
+    [
+        uncalibrated_bins_df.assign(model_version="uncalibrated"),
+        calibrated_bins_df.assign(model_version="calibrated"),
+    ],
+    ignore_index=True,
+)
+
+confidence_threshold_summary_df = pd.concat(
+    [
+        uncalibrated_thresholds_df.assign(model_version="uncalibrated"),
+        calibrated_thresholds_df.assign(model_version="calibrated"),
+    ],
+    ignore_index=True,
+)
+
+calibration_comparison_df.to_csv("calibration_comparison.csv", index=False)
+calibration_bins_df.to_csv("calibration_bins.csv", index=False)
+confidence_threshold_summary_df.to_csv(
+    "confidence_threshold_summary.csv",
+    index=False,
+)
+
+joblib.dump(calibrated_model, "final_model.pkl")
 
 plot_final_model_scores(
     best_model_name=best_model_name,
-    train_score=train_score,
-    cv_score=best_study.best_value,
-    test_score=test_score,
+    selection_cv_score=selection_cv_score,
+    uncalibrated_test_score=uncalibrated_test_score,
+    calibrated_test_score=calibrated_test_score,
     scoring_metric=scoring_metric,
     out_path=os.path.join(out_dir, "plot_final_model_scores.png"),
+)
+
+plot_reliability_comparison(
+    calibration_bins_df=calibration_bins_df,
+    out_path=os.path.join(out_dir, "plot_reliability_comparison.png"),
 )
 
 with mlflow.start_run(run_name="final_model"):
     log_data_source_params()
     mlflow.log_param("winning_model_family", best_model_name)
     mlflow.log_param("winning_lazy_name", best_lazy_name)
-    mlflow.log_metric("best_score", best_study.best_value)
-    if not np.isnan(train_score):
-        mlflow.log_metric("train_score", float(train_score))
-
-    if not np.isnan(test_score):
-        mlflow.log_metric("test_score", float(test_score))
+    mlflow.log_param("calibration_method", "sigmoid")
+    mlflow.log_param("calibration_cv_folds", cv.get_n_splits())
+    mlflow.log_param("calibration_ensemble", False)
+    log_metric_if_valid("selection_cv_score", selection_cv_score)
+    log_metric_if_valid("uncalibrated_test_score", uncalibrated_summary["score"])
+    log_metric_if_valid("calibrated_test_score", calibrated_summary["score"])
+    log_metric_if_valid("uncalibrated_test_log_loss", uncalibrated_summary["log_loss"])
+    log_metric_if_valid("calibrated_test_log_loss", calibrated_summary["log_loss"])
+    log_metric_if_valid("uncalibrated_test_ece", uncalibrated_summary["ece"])
+    log_metric_if_valid("calibrated_test_ece", calibrated_summary["ece"])
 
     mlflow.log_artifact("final_model.pkl")
     mlflow.log_artifact("optuna_model_comparison.csv")
+    mlflow.log_artifact("calibration_comparison.csv")
+    mlflow.log_artifact("calibration_bins.csv")
+    mlflow.log_artifact("confidence_threshold_summary.csv")
     mlflow.log_artifact(os.path.join(out_dir, "plot_final_model_scores.png"))
-    mlflow.sklearn.log_model(final_pipeline, artifact_path="final_sklearn_model")
+    mlflow.log_artifact(os.path.join(out_dir, "plot_reliability_comparison.png"))
+    mlflow.sklearn.log_model(calibrated_model, artifact_path="final_sklearn_model")
 
 print("Best model:", best_model_name)
-print("Best score:", best_study.best_value)
-print("Train score:", train_score)
-print("Test score:", test_score)
-print("Saved final model to final_model.pkl")
+print("Selection CV score:", selection_cv_score)
+print("Uncalibrated test score:", uncalibrated_test_score)
+print("Calibrated test score:", calibrated_test_score)
+print("Uncalibrated test log loss:", uncalibrated_summary["log_loss"])
+print("Calibrated test log loss:", calibrated_summary["log_loss"])
+print("Uncalibrated test ECE:", uncalibrated_summary["ece"])
+print("Calibrated test ECE:", calibrated_summary["ece"])
+print("Saved calibrated final model to final_model.pkl")
