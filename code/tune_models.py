@@ -14,6 +14,7 @@ from catboost import CatBoostClassifier
 from lightgbm import LGBMClassifier
 from sklearn.compose import ColumnTransformer
 from sklearn.datasets import load_breast_cancer
+from sklearn.ensemble import ExtraTreesClassifier, RandomForestClassifier
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, roc_auc_score
@@ -29,7 +30,7 @@ random_state = 123
 test_size = 0.2
 cv_folds = 5
 optuna_n_trials = 30
-scoring_metric = "roc_auc"
+scoring_metric = "roc_auc_ovr"
 mlflow_experiment_name = "cytof_annotation"
 out_dir = "../results/tune_models/cytof_annotation"
 os.makedirs(out_dir, exist_ok=True)
@@ -41,12 +42,14 @@ target_column = "label"
 stdscaler_with_mean = True
 
 top_models_to_tune = [
-    "LogisticRegression",
     #"LinearSVC",
     #"SVC",
     #"XGBClassifier",
-    "LGBMClassifier",
     "CatBoostClassifier",
+    #"LogisticRegression",
+    "ExtraTreesClassifier",
+    "RandomForestClassifier",
+    "LGBMClassifier",
 ]
 
 MODEL_NAME_MAP = {
@@ -54,6 +57,8 @@ MODEL_NAME_MAP = {
     "LinearSVC": "linearsvc",
     "SVC": "svc",
     "XGBClassifier": "xgb",
+    "RandomForestClassifier": "rf",
+    "ExtraTreesClassifier": "extratrees",
     "LGBMClassifier": "lgbm",
     "CatBoostClassifier": "catboost",
 }
@@ -175,6 +180,36 @@ def build_pipeline(trial, model_name):
         )
         return Pipeline([("preprocessor", preprocessor), ("model", model)])
 
+    if model_name == "rf":
+        model = RandomForestClassifier(
+            n_estimators=trial.suggest_int("n_estimators", 100, 500),
+            max_depth=trial.suggest_categorical("max_depth", [None, 5, 10, 20, 40]),
+            min_samples_split=trial.suggest_int("min_samples_split", 2, 20),
+            min_samples_leaf=trial.suggest_int("min_samples_leaf", 1, 10),
+            max_features=trial.suggest_categorical(
+                "max_features", ["sqrt", "log2", None]
+            ),
+            bootstrap=trial.suggest_categorical("bootstrap", [True, False]),
+            random_state=random_state,
+            n_jobs=1,
+        )
+        return Pipeline([("preprocessor", preprocessor), ("model", model)])
+
+    if model_name == "extratrees":
+        model = ExtraTreesClassifier(
+            n_estimators=trial.suggest_int("n_estimators", 100, 500),
+            max_depth=trial.suggest_categorical("max_depth", [None, 5, 10, 20, 40]),
+            min_samples_split=trial.suggest_int("min_samples_split", 2, 20),
+            min_samples_leaf=trial.suggest_int("min_samples_leaf", 1, 10),
+            max_features=trial.suggest_categorical(
+                "max_features", ["sqrt", "log2", None]
+            ),
+            bootstrap=trial.suggest_categorical("bootstrap", [False, True]),
+            random_state=random_state,
+            n_jobs=1,
+        )
+        return Pipeline([("preprocessor", preprocessor), ("model", model)])
+
     if model_name == "lgbm":
         model = LGBMClassifier(
             n_estimators=trial.suggest_int("n_estimators", 100, 500),
@@ -227,11 +262,14 @@ def log_data_source_params():
 
 
 def compute_score(model, X, y, scoring_metric, num_classes):
-    if scoring_metric == "roc_auc" and hasattr(model, "predict_proba"):
+    if scoring_metric in {"roc_auc", "roc_auc_ovr", "roc_auc_ovo"} and hasattr(
+        model, "predict_proba"
+    ):
         proba = model.predict_proba(X)
         if num_classes == 2:
             return roc_auc_score(y, proba[:, 1])
-        return roc_auc_score(y, proba, multi_class="ovr", average="macro")
+        multi_class_mode = "ovo" if scoring_metric == "roc_auc_ovo" else "ovr"
+        return roc_auc_score(y, proba, multi_class=multi_class_mode, average="macro")
 
     if scoring_metric == "accuracy":
         pred = model.predict(X)
