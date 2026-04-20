@@ -9,6 +9,7 @@ import mlflow.sklearn
 import numpy as np
 import optuna
 import pandas as pd
+from pathlib import Path
 
 from catboost import CatBoostClassifier
 from lightgbm import LGBMClassifier
@@ -35,9 +36,29 @@ scoring_metric = "roc_auc_ovr"
 mlflow_experiment_name = "cytof_annotation"
 out_dir = "../results/tune_models/cytof_annotation"
 os.makedirs(out_dir, exist_ok=True)
+out_dir = os.path.abspath(out_dir)
+tracking_dir = os.path.join(out_dir, "mlruns")
+os.makedirs(tracking_dir, exist_ok=True)
+mlflow_tracking_uri = Path(tracking_dir).as_uri()
 train_path = "../data/train.csv"
 test_path = "../data/test.csv"
 target_column = "label"
+
+optuna_comparison_path = os.path.join(out_dir, "optuna_model_comparison.csv")
+calibration_comparison_path = os.path.join(out_dir, "calibration_comparison.csv")
+calibration_bins_path = os.path.join(out_dir, "calibration_bins.csv")
+confidence_threshold_summary_path = os.path.join(
+    out_dir,
+    "confidence_threshold_summary.csv",
+)
+final_model_path = os.path.join(out_dir, "final_model.pkl")
+plot_model_comparison_path = os.path.join(out_dir, "plot_model_comparison.png")
+plot_cv_score_spread_path = os.path.join(out_dir, "plot_cv_score_spread.png")
+plot_final_model_scores_path = os.path.join(out_dir, "plot_final_model_scores.png")
+plot_reliability_comparison_path = os.path.join(
+    out_dir,
+    "plot_reliability_comparison.png",
+)
 
 # Set to False if preprocessing can produce a sparse matrix, for example after one-hot encoding.
 stdscaler_with_mean = True
@@ -518,6 +539,7 @@ def make_objective(model_name):
 
 # %% ----- MAIN -----
 
+mlflow.set_tracking_uri(mlflow_tracking_uri)
 mlflow.set_experiment(mlflow_experiment_name)
 
 results = []
@@ -559,25 +581,25 @@ for lazy_name in top_models_to_tune:
         )
 
 results_df = pd.DataFrame(results).sort_values("best_score", ascending=False)
-results_df.to_csv("optuna_model_comparison.csv", index=False)
+results_df.to_csv(optuna_comparison_path, index=False)
 
 plot_model_comparison(
     results_df=results_df,
     scoring_metric=scoring_metric,
-    out_path=os.path.join(out_dir, "plot_model_comparison.png"),
+    out_path=plot_model_comparison_path,
 )
 
 plot_cv_score_spread(
     results_df=results_df,
     scoring_metric=scoring_metric,
-    out_path=os.path.join(out_dir, "plot_cv_score_spread.png"),
+    out_path=plot_cv_score_spread_path,
 )
 
 with mlflow.start_run(run_name="model_comparison_summary"):
     log_data_source_params()
-    mlflow.log_artifact("optuna_model_comparison.csv")
-    mlflow.log_artifact(os.path.join(out_dir, "plot_model_comparison.png"))
-    mlflow.log_artifact(os.path.join(out_dir, "plot_cv_score_spread.png"))
+    mlflow.log_artifact(optuna_comparison_path)
+    mlflow.log_artifact(plot_model_comparison_path)
+    mlflow.log_artifact(plot_cv_score_spread_path)
 
 print(results_df)
 
@@ -675,14 +697,14 @@ confidence_threshold_summary_df = pd.concat(
     ignore_index=True,
 )
 
-calibration_comparison_df.to_csv("calibration_comparison.csv", index=False)
-calibration_bins_df.to_csv("calibration_bins.csv", index=False)
+calibration_comparison_df.to_csv(calibration_comparison_path, index=False)
+calibration_bins_df.to_csv(calibration_bins_path, index=False)
 confidence_threshold_summary_df.to_csv(
-    "confidence_threshold_summary.csv",
+    confidence_threshold_summary_path,
     index=False,
 )
 
-joblib.dump(calibrated_model, "final_model.pkl")
+joblib.dump(calibrated_model, final_model_path)
 
 plot_final_model_scores(
     best_model_name=best_model_name,
@@ -690,12 +712,12 @@ plot_final_model_scores(
     uncalibrated_test_score=uncalibrated_test_score,
     calibrated_test_score=calibrated_test_score,
     scoring_metric=scoring_metric,
-    out_path=os.path.join(out_dir, "plot_final_model_scores.png"),
+    out_path=plot_final_model_scores_path,
 )
 
 plot_reliability_comparison(
     calibration_bins_df=calibration_bins_df,
-    out_path=os.path.join(out_dir, "plot_reliability_comparison.png"),
+    out_path=plot_reliability_comparison_path,
 )
 
 with mlflow.start_run(run_name="final_model"):
@@ -713,13 +735,13 @@ with mlflow.start_run(run_name="final_model"):
     log_metric_if_valid("uncalibrated_test_ece", uncalibrated_summary["ece"])
     log_metric_if_valid("calibrated_test_ece", calibrated_summary["ece"])
 
-    mlflow.log_artifact("final_model.pkl")
-    mlflow.log_artifact("optuna_model_comparison.csv")
-    mlflow.log_artifact("calibration_comparison.csv")
-    mlflow.log_artifact("calibration_bins.csv")
-    mlflow.log_artifact("confidence_threshold_summary.csv")
-    mlflow.log_artifact(os.path.join(out_dir, "plot_final_model_scores.png"))
-    mlflow.log_artifact(os.path.join(out_dir, "plot_reliability_comparison.png"))
+    mlflow.log_artifact(final_model_path)
+    mlflow.log_artifact(optuna_comparison_path)
+    mlflow.log_artifact(calibration_comparison_path)
+    mlflow.log_artifact(calibration_bins_path)
+    mlflow.log_artifact(confidence_threshold_summary_path)
+    mlflow.log_artifact(plot_final_model_scores_path)
+    mlflow.log_artifact(plot_reliability_comparison_path)
     mlflow.sklearn.log_model(calibrated_model, artifact_path="final_sklearn_model")
 
 print("Best model:", best_model_name)
@@ -730,4 +752,4 @@ print("Uncalibrated test log loss:", uncalibrated_summary["log_loss"])
 print("Calibrated test log loss:", calibrated_summary["log_loss"])
 print("Uncalibrated test ECE:", uncalibrated_summary["ece"])
 print("Calibrated test ECE:", calibrated_summary["ece"])
-print("Saved calibrated final model to final_model.pkl")
+print("Saved calibrated final model to", final_model_path)
