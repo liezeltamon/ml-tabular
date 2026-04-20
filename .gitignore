@@ -36,6 +36,7 @@ sps-*
 
 # Local data and scratch directories
 data-raw/
+dump/
 *_files
 *_cache
 z_ignore_git/
