@@ -1,6 +1,7 @@
 # %% Tune shortlisted models and save the final pipeline
-# sbatch -J tune_models -p long --mem=200G --output=%x.log.out --error=%x.log.err --wrap="python tune_models.py"
+# sbatch -J parallel.tune_models -p long --mem=250G --cpus-per-task=11 --output=%x.log.out --error=%x.log.err --wrap="python tune_models.py --n-jobs 10 --mlflow-experiment-name cytof_annotation_parallel"
 
+import argparse
 import joblib
 import os
 import matplotlib.pyplot as plt
@@ -10,6 +11,7 @@ import numpy as np
 import optuna
 import pandas as pd
 from pathlib import Path
+import time
 
 from catboost import CatBoostClassifier
 from lightgbm import LGBMClassifier
@@ -33,9 +35,33 @@ test_size = 0.2
 cv_folds = 5
 optuna_n_trials = 30
 scoring_metric = "roc_auc_ovr"
-mlflow_experiment_name = "cytof_annotation"
-out_dir = "../results/tune_models/cytof_annotation"
+
+parser = argparse.ArgumentParser()
+parser.add_argument(
+    "--n-jobs",
+    dest="n_jobs",
+    type=int,
+    default=1,
+    help="Number of Optuna trials to run in parallel within each model family.",
+)
+parser.add_argument(
+    "--mlflow-experiment-name",
+    dest="mlflow_experiment_name",
+    type=str,
+    required=True,
+    help="MLflow experiment name. Output files are written to results/tune_models/<experiment_name>.",
+)
+args = parser.parse_args()
+
+n_jobs = args.n_jobs
+if n_jobs < 1:
+    raise ValueError("n_jobs must be at least 1")
+
+mlflow_experiment_name = args.mlflow_experiment_name
+out_dir = os.path.join("..", "results", "tune_models", mlflow_experiment_name)
 os.makedirs(out_dir, exist_ok=True)
+# MLflow tracking uses Path(...).as_uri(), which requires an absolute path.
+# Keeping out_dir absolute also makes printed/logged artifact paths unambiguous.
 out_dir = os.path.abspath(out_dir)
 tracking_dir = os.path.join(out_dir, "mlruns")
 os.makedirs(tracking_dir, exist_ok=True)
@@ -140,7 +166,7 @@ preprocessor = ColumnTransformer(
 
 cv = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=random_state)
 
-def build_pipeline(trial, model_name):
+def build_pipeline(trial, model_name, fit_label=None):
     if model_name == "logreg":
         model = LogisticRegression(
             C=trial.suggest_float("C", 1e-3, 100, log=True),
@@ -198,6 +224,7 @@ def build_pipeline(trial, model_name):
             reg_alpha=trial.suggest_float("reg_alpha", 1e-8, 10.0, log=True),
             reg_lambda=trial.suggest_float("reg_lambda", 1e-8, 10.0, log=True),
             eval_metric="logloss",
+            n_jobs=1,
             random_state=random_state,
         )
         return Pipeline([("preprocessor", preprocessor), ("model", model)])
@@ -242,18 +269,32 @@ def build_pipeline(trial, model_name):
             colsample_bytree=trial.suggest_float("colsample_bytree", 0.5, 1.0),
             reg_alpha=trial.suggest_float("reg_alpha", 1e-8, 10.0, log=True),
             reg_lambda=trial.suggest_float("reg_lambda", 1e-8, 10.0, log=True),
+            n_jobs=1,
             random_state=random_state,
             verbose=-1,
         )
         return Pipeline([("preprocessor", preprocessor), ("model", model)])
 
     if model_name == "catboost":
+        catboost_info_dir = os.path.join(out_dir, "catboost_info")
+        os.makedirs(catboost_info_dir, exist_ok=True)
+        if fit_label is not None:
+            catboost_train_dir = os.path.join(catboost_info_dir, fit_label)
+        elif hasattr(trial, "number"):
+            catboost_train_dir = os.path.join(
+                catboost_info_dir,
+                f"trial_{trial.number}",
+            )
+        else:
+            catboost_train_dir = os.path.join(catboost_info_dir, "run")
         model = CatBoostClassifier(
             iterations=trial.suggest_int("iterations", 100, 500),
             depth=trial.suggest_int("depth", 4, 10),
             learning_rate=trial.suggest_float("learning_rate", 1e-3, 0.3, log=True),
             l2_leaf_reg=trial.suggest_float("l2_leaf_reg", 1e-3, 10, log=True),
             random_state=random_state,
+            thread_count=1,
+            train_dir=catboost_train_dir,
             verbose=0,
         )
         return Pipeline([("preprocessor", preprocessor), ("model", model)])
@@ -542,6 +583,7 @@ def make_objective(model_name):
 mlflow.set_tracking_uri(mlflow_tracking_uri)
 mlflow.set_experiment(mlflow_experiment_name)
 
+overall_start = time.perf_counter()
 results = []
 studies = {}
 
@@ -559,10 +601,15 @@ for lazy_name in top_models_to_tune:
         mlflow.log_param("cv_folds", cv.get_n_splits())
         mlflow.log_param("scoring", scoring_metric)
         mlflow.log_param("optuna_n_trials", optuna_n_trials)
+        mlflow.log_param("n_jobs", n_jobs)
         mlflow.log_param("test_size", test_size)
 
         study = optuna.create_study(direction="maximize")
-        study.optimize(make_objective(model_name), n_trials=optuna_n_trials)
+        study.optimize(
+            make_objective(model_name),
+            n_trials=optuna_n_trials,
+            n_jobs=n_jobs,
+        )
 
         studies[model_name] = study
         mlflow.log_metric("best_score", study.best_value)
@@ -609,11 +656,17 @@ best_study = studies[best_model_name]
 num_classes = len(np.unique(y_train))
 
 uncalibrated_final_pipeline = build_pipeline(
-    FixedTrial(best_study.best_params), best_model_name
+    FixedTrial(best_study.best_params),
+    best_model_name,
+    fit_label="final_uncalibrated",
 )
 uncalibrated_final_pipeline.fit(X_train, y_train)
 
-best_pipeline = build_pipeline(FixedTrial(best_study.best_params), best_model_name)
+best_pipeline = build_pipeline(
+    FixedTrial(best_study.best_params),
+    best_model_name,
+    fit_label="final_calibrated",
+)
 calibrated_model = CalibratedClassifierCV(
     estimator=best_pipeline,
     method="sigmoid",
@@ -727,6 +780,7 @@ with mlflow.start_run(run_name="final_model"):
     mlflow.log_param("calibration_method", "sigmoid")
     mlflow.log_param("calibration_cv_folds", cv.get_n_splits())
     mlflow.log_param("calibration_ensemble", False)
+    mlflow.log_param("n_jobs", n_jobs)
     log_metric_if_valid("selection_cv_score", selection_cv_score)
     log_metric_if_valid("uncalibrated_test_score", uncalibrated_summary["score"])
     log_metric_if_valid("calibrated_test_score", calibrated_summary["score"])
@@ -744,7 +798,10 @@ with mlflow.start_run(run_name="final_model"):
     mlflow.log_artifact(plot_reliability_comparison_path)
     mlflow.sklearn.log_model(calibrated_model, artifact_path="final_sklearn_model")
 
+overall_duration = time.perf_counter() - overall_start
+
 print("Best model:", best_model_name)
+print("n_jobs:", n_jobs)
 print("Selection CV score:", selection_cv_score)
 print("Uncalibrated test score:", uncalibrated_test_score)
 print("Calibrated test score:", calibrated_test_score)
@@ -753,3 +810,7 @@ print("Calibrated test log loss:", calibrated_summary["log_loss"])
 print("Uncalibrated test ECE:", uncalibrated_summary["ece"])
 print("Calibrated test ECE:", calibrated_summary["ece"])
 print("Saved calibrated final model to", final_model_path)
+print(
+    f"Total runtime (seconds): {overall_duration:.2f} "
+    f"({overall_duration / 60:.2f} minutes)"
+)
