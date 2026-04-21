@@ -77,7 +77,8 @@ confidence_threshold_summary_path = os.path.join(
     out_dir,
     "confidence_threshold_summary.csv",
 )
-final_model_path = os.path.join(out_dir, "final_model.pkl")
+final_model_calibrated_path = os.path.join(out_dir, "final_model_calibrated.pkl")
+final_model_uncalibrated_path = os.path.join(out_dir, "final_model_uncalibrated.pkl")
 plot_model_comparison_path = os.path.join(out_dir, "plot_model_comparison.png")
 plot_cv_score_spread_path = os.path.join(out_dir, "plot_cv_score_spread.png")
 plot_final_model_scores_path = os.path.join(out_dir, "plot_final_model_scores.png")
@@ -340,7 +341,7 @@ def compute_score(model, X, y, scoring_metric, num_classes):
         return roc_auc_score(y, proba, multi_class=multi_class_mode, average="macro")
 
     if scoring_metric == "accuracy":
-        pred = model.predict(X)
+        pred = np.asarray(model.predict(X)).reshape(-1)
         return accuracy_score(y, pred)
 
     return np.nan
@@ -463,7 +464,9 @@ def plot_final_model_scores(
 def summarise_calibration(model, X, y, scoring_metric, num_classes, bin_edges, thresholds):
     y_series = pd.Series(y).reset_index(drop=True)
     proba = model.predict_proba(X)
-    pred = pd.Series(model.predict(X))
+    pred = model.predict(X)
+    pred = np.asarray(pred).reshape(-1)
+    pred = pd.Series(pred).reset_index(drop=True)
     confidence = proba.max(axis=1)
     correct = (pred.values == y_series.values).astype(float)
 
@@ -757,7 +760,8 @@ confidence_threshold_summary_df.to_csv(
     index=False,
 )
 
-joblib.dump(calibrated_model, final_model_path)
+joblib.dump(uncalibrated_final_pipeline, final_model_uncalibrated_path)
+joblib.dump(calibrated_model, final_model_calibrated_path)
 
 plot_final_model_scores(
     best_model_name=best_model_name,
@@ -789,7 +793,8 @@ with mlflow.start_run(run_name="final_model"):
     log_metric_if_valid("uncalibrated_test_ece", uncalibrated_summary["ece"])
     log_metric_if_valid("calibrated_test_ece", calibrated_summary["ece"])
 
-    mlflow.log_artifact(final_model_path)
+    mlflow.log_artifact(final_model_calibrated_path)
+    mlflow.log_artifact(final_model_uncalibrated_path)
     mlflow.log_artifact(optuna_comparison_path)
     mlflow.log_artifact(calibration_comparison_path)
     mlflow.log_artifact(calibration_bins_path)
@@ -809,7 +814,8 @@ print("Uncalibrated test log loss:", uncalibrated_summary["log_loss"])
 print("Calibrated test log loss:", calibrated_summary["log_loss"])
 print("Uncalibrated test ECE:", uncalibrated_summary["ece"])
 print("Calibrated test ECE:", calibrated_summary["ece"])
-print("Saved calibrated final model to", final_model_path)
+print("Saved calibrated final model to", final_model_calibrated_path)
+print("Saved uncalibrated final model to", final_model_uncalibrated_path)
 print(
     f"Total runtime (seconds): {overall_duration:.2f} "
     f"({overall_duration / 60:.2f} minutes)"
