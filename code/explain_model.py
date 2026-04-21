@@ -1,4 +1,4 @@
-# sbatch -J explain_model -p long --mem=100G --output=%x.log.out --error=%x.log.err --wrap="python explain_model.py --model-path final_model.pkl --data-path ../data/test.csv --label-column label --out-dir ../results/explain_model/test_data --max-samples 1000000"
+# sbatch -J explain_model -p long --mem=100G --output=%x.log.out --error=%x.log.err --wrap="python explain_model.py --model-path final_model_calibrated.pkl --data-path ../data/test.csv --label-column label --out-dir ../results/explain_model/test_data --max-samples 1000000"
 
 import argparse
 from pathlib import Path
@@ -231,7 +231,7 @@ parser = argparse.ArgumentParser(
 parser.add_argument(
     "--model-path",
     required=True,
-    help="Path to a saved joblib pipeline such as final_model.pkl.",
+    help="Path to a saved joblib pipeline such as final_model_calibrated.pkl.",
 )
 parser.add_argument(
     "--data-path",
