@@ -8,6 +8,9 @@ mamba run -n "${ENV_NAME}" pip install "flaml[automl]"
 mamba run -n "${ENV_NAME}" pip install lazypredict[boost]
 mamba run -n "${ENV_NAME}" pip install mlflow optuna
 mamba run -n "${ENV_NAME}" pip install shap
+mamba run -n "${ENV_NAME}" pip install ipywidgets
+mamba run -n "${ENV_NAME}" pip install category_encoders
+mamba run -n "${ENV_NAME}" pip install feature-engine
 
 printf "\nEnvironment created. Activate it with:\n"
 printf "mamba activate %s\n" "${ENV_NAME}"
