@@ -3,6 +3,8 @@
 # sbatch -J benchmark_models_progb_vs_nonprogb_selected_models -p short,long --mem=50G --output=logs/%x.log.out --error=logs/%x.log.err --wrap="python benchmark_models.py --out-dir results/benchmark_models/progb_vs_nonprogb_selected_models"
 # sbatch -J gpu_benchmark_models_progb_vs_nonprogb_include_tree_based -p gpu_interactive --gres gpu:1 --output=logs/%x.log.out --error=logs/%x.log.err --wrap="python benchmark_models.py --out-dir results/benchmark_models/progb_vs_nonprogb_selected_models_include_tree_based_gpu --use-gpu"
 # sbatch -J benchmark_models_progb_vs_nonprogb_include_tree_based -p long --mem=50G --output=logs/%x.log.out --error=logs/%x.log.err --wrap="python benchmark_models.py --out-dir results/benchmark_models/progb_vs_nonprogb_selected_models_include_tree_based --use-gpu"
+# sbatch -J benchmark_models_progb_vs_nonprogb_selectkbest_p005 -p short,long --mem=50G --output=logs/%x.log.out --error=logs/%x.log.err --wrap="python benchmark_models.py --out-dir results/benchmark_models/progb_vs_nonprogb_selectkbest_p005 --train-path /well/immune-rep/users/yfg436/git/ml-tabular/results/select_features/progb_vs_nonprogb_selectkbest_p005/train.csv --test-path /well/immune-rep/users/yfg436/git/ml-tabular/results/select_features/progb_vs_nonprogb_selectkbest_p005/test.csv --target-column is_progb --out-dir results/benchmark_models/progb_vs_nonprogb_selectkbest_p005_selected_models_include_tree_based"
+# sbatch -J benchmark_models_progb_vs_nonprogb_selectkbest_p005_all -p short,long --mem=50G --output=logs/%x.log.out --error=logs/%x.log.err --wrap="python benchmark_models.py --out-dir results/benchmark_models/progb_vs_nonprogb_selectkbest_p005 --train-path /well/immune-rep/users/yfg436/git/ml-tabular/results/select_features/progb_vs_nonprogb_selectkbest_p005/train.csv --test-path /well/immune-rep/users/yfg436/git/ml-tabular/results/select_features/progb_vs_nonprogb_selectkbest_p005/test.csv --target-column is_progb --out-dir results/benchmark_models/progb_vs_nonprogb_selectkbest_p005"
 
 import argparse
 import os
@@ -39,6 +41,21 @@ parser.add_argument(
     help="Output directory for benchmark result CSVs.",
 )
 parser.add_argument(
+    "--train-path",
+    default="../data/train.csv",
+    help="Training CSV path. Read with index_col=0.",
+)
+parser.add_argument(
+    "--test-path",
+    default="../data/test.csv",
+    help="Test CSV path. Read with index_col=0.",
+)
+parser.add_argument(
+    "--target-column",
+    default="is_progb",
+    help="Target column name in train and test CSVs.",
+)
+parser.add_argument(
     "--use-gpu",
     action="store_true",
     help="Whether to use GPU acceleration for supported models (only for lazypredict).",
@@ -48,17 +65,17 @@ args = parser.parse_args()
 benchmark_method = "lazypredict"    # "lazypredict" or "flaml"
 lazypredict_sorter_key = "ROC AUC"  # "Accuracy", "Balanced Accuracy", "ROC AUC", "F1 Score", "Time Taken"
 categorical_encoder = "onehot" # "onehot", "ordinal", "target", "binary"
-classifiers = [
-    LinearSVC, LogisticRegression, SGDClassifier, RidgeClassifier, RidgeClassifierCV, LinearDiscriminantAnalysis,
-    RandomForestClassifier, xgboost.XGBClassifier, lightgbm.LGBMClassifier,
-    #RandomForestClassifier, DecisionTreeClassifier GradientBoostingClassifier,
-    DummyClassifier,
-] # "all" to use all available classifiers, or a list of specific classifiers to benchmark (e.g. [RandomForestClassifier, DecisionTreeClassifier])
+classifiers = "all" #[
+#     LinearSVC, LogisticRegression, SGDClassifier, RidgeClassifier, RidgeClassifierCV, LinearDiscriminantAnalysis,
+#     RandomForestClassifier, xgboost.XGBClassifier, lightgbm.LGBMClassifier,
+#     #RandomForestClassifier, DecisionTreeClassifier GradientBoostingClassifier,
+#     DummyClassifier,
+# ] # "all" to use all available classifiers, or a list of specific classifiers to benchmark (e.g. [RandomForestClassifier, DecisionTreeClassifier])
 use_gpu = args.use_gpu  # Only for lazypredict and supported models, not for flaml
 
-target_column = "is_progb" #"label"
-train_path = "/well/immune-rep/users/yfg436/git/sle/results/prediction/create_input_table/group_id_nonprogb_progb_missingness0_minuniqueNone/train.csv" #"data/train.csv"
-test_path = "/well/immune-rep/users/yfg436/git/sle/results/prediction/create_input_table/group_id_nonprogb_progb_missingness0_minuniqueNone/test.csv" #"data/test.csv"
+target_column = args.target_column
+train_path = args.train_path
+test_path = args.test_path
 
 out_dir = args.out_dir
 
