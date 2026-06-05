@@ -1,6 +1,8 @@
 # %% Tune shortlisted models and save the final pipeline
 # sbatch -J parallel.tune_models -p long --mem=250G --cpus-per-task=11 --output=%x.log.out --error=%x.log.err --wrap="python tune_models.py --n-jobs 10 --mlflow-experiment-name cytof_annotation_parallel"
 
+# sbatch -J tune_models_progb_vs_nonprogb_selectkbest_p005_top5 -p long --mem=100G --cpus-per-task=11 --output=logs/%x.log.out --error=logs/%x.log.err --wrap="python tune_models.py --n-jobs 10 --mlflow-experiment-name progb_vs_nonprogb_selectkbest_p005_top5 --train-path /well/immune-rep/users/yfg436/git/ml-tabular/results/select_features/progb_vs_nonprogb_selectkbest_p005/train.csv --test-path /well/immune-rep/users/yfg436/git/ml-tabular/results/select_features/progb_vs_nonprogb_selectkbest_p005/test.csv --target-column is_progb"
+
 import argparse
 import joblib
 import os
@@ -18,7 +20,8 @@ from lightgbm import LGBMClassifier
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.compose import ColumnTransformer
 from sklearn.datasets import load_breast_cancer
-from sklearn.ensemble import ExtraTreesClassifier, RandomForestClassifier
+from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
+from sklearn.ensemble import AdaBoostClassifier, ExtraTreesClassifier, RandomForestClassifier
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, log_loss, roc_auc_score
@@ -30,11 +33,19 @@ from xgboost import XGBClassifier
 
 # %% Parameters
 
+top_models_to_tune = [
+    "XGBClassifier",
+    "AdaBoostClassifier",
+    "RandomForestClassifier",
+    "LinearSVC",
+    "LinearDiscriminantAnalysis",
+]
+
 random_state = 123
 test_size = 0.2
 cv_folds = 5
 optuna_n_trials = 30
-scoring_metric = "roc_auc_ovr"
+scoring_metric = "roc_auc" #"roc_auc_ovr"
 
 parser = argparse.ArgumentParser()
 parser.add_argument(
@@ -51,6 +62,21 @@ parser.add_argument(
     required=True,
     help="MLflow experiment name. Output files are written to results/tune_models/<experiment_name>.",
 )
+parser.add_argument(
+    "--train-path",
+    default="../data/train.csv",
+    help="Training CSV path. Read with index_col=0.",
+)
+parser.add_argument(
+    "--test-path",
+    default="../data/test.csv",
+    help="Test CSV path. Read with index_col=0.",
+)
+parser.add_argument(
+    "--target-column",
+    default="label",
+    help="Target column name in train and test CSVs.",
+)
 args = parser.parse_args()
 
 n_jobs = args.n_jobs
@@ -66,9 +92,9 @@ out_dir = os.path.abspath(out_dir)
 tracking_dir = os.path.join(out_dir, "mlruns")
 os.makedirs(tracking_dir, exist_ok=True)
 mlflow_tracking_uri = Path(tracking_dir).as_uri()
-train_path = "../data/train.csv"
-test_path = "../data/test.csv"
-target_column = "label"
+train_path = args.train_path
+test_path = args.test_path
+target_column = args.target_column
 
 optuna_comparison_path = os.path.join(out_dir, "optuna_model_comparison.csv")
 calibration_comparison_path = os.path.join(out_dir, "calibration_comparison.csv")
@@ -90,23 +116,14 @@ plot_reliability_comparison_path = os.path.join(
 # Set to False if preprocessing can produce a sparse matrix, for example after one-hot encoding.
 stdscaler_with_mean = True
 
-top_models_to_tune = [
-    #"LinearSVC",
-    #"SVC",
-    #"XGBClassifier",
-    "CatBoostClassifier",
-    #"LogisticRegression",
-    "ExtraTreesClassifier",
-    "RandomForestClassifier",
-    "LGBMClassifier",
-]
-
 MODEL_NAME_MAP = {
     "LogisticRegression": "logreg",
     "LinearSVC": "linearsvc",
+    "LinearDiscriminantAnalysis": "lda",
     "SVC": "svc",
     "XGBClassifier": "xgb",
     "RandomForestClassifier": "rf",
+    "AdaBoostClassifier": "adaboost",
     "ExtraTreesClassifier": "extratrees",
     "LGBMClassifier": "lgbm",
     "CatBoostClassifier": "catboost",
@@ -198,6 +215,23 @@ def build_pipeline(trial, model_name, fit_label=None):
             ]
         )
 
+    if model_name == "lda":
+        solver = trial.suggest_categorical("solver", ["svd", "lsqr"])
+        shrinkage = None
+        if solver == "lsqr":
+            shrinkage = trial.suggest_categorical("shrinkage", [None, "auto"])
+        model = LinearDiscriminantAnalysis(
+            solver=solver,
+            shrinkage=shrinkage,
+        )
+        return Pipeline(
+            [
+                ("preprocessor", preprocessor),
+                ("scaler", StandardScaler(with_mean=stdscaler_with_mean)),
+                ("model", model),
+            ]
+        )
+
     if model_name == "svc":
         model = SVC(
             C=trial.suggest_float("C", 1e-3, 100, log=True),
@@ -242,6 +276,14 @@ def build_pipeline(trial, model_name, fit_label=None):
             bootstrap=trial.suggest_categorical("bootstrap", [True, False]),
             random_state=random_state,
             n_jobs=1,
+        )
+        return Pipeline([("preprocessor", preprocessor), ("model", model)])
+
+    if model_name == "adaboost":
+        model = AdaBoostClassifier(
+            n_estimators=trial.suggest_int("n_estimators", 50, 500),
+            learning_rate=trial.suggest_float("learning_rate", 1e-3, 2.0, log=True),
+            random_state=random_state,
         )
         return Pipeline([("preprocessor", preprocessor), ("model", model)])
 
@@ -331,14 +373,21 @@ def log_metric_if_valid(name, value):
 
 
 def compute_score(model, X, y, scoring_metric, num_classes):
-    if scoring_metric in {"roc_auc", "roc_auc_ovr", "roc_auc_ovo"} and hasattr(
-        model, "predict_proba"
-    ):
-        proba = model.predict_proba(X)
-        if num_classes == 2:
-            return roc_auc_score(y, proba[:, 1])
-        multi_class_mode = "ovo" if scoring_metric == "roc_auc_ovo" else "ovr"
-        return roc_auc_score(y, proba, multi_class=multi_class_mode, average="macro")
+    if scoring_metric in {"roc_auc", "roc_auc_ovr", "roc_auc_ovo"}:
+        if hasattr(model, "predict_proba"):
+            proba = model.predict_proba(X)
+            if num_classes == 2:
+                return roc_auc_score(y, proba[:, 1])
+            multi_class_mode = "ovo" if scoring_metric == "roc_auc_ovo" else "ovr"
+            return roc_auc_score(
+                y, proba, multi_class=multi_class_mode, average="macro"
+            )
+
+        if num_classes == 2 and hasattr(model, "decision_function"):
+            decision_scores = model.decision_function(X)
+            return roc_auc_score(y, decision_scores)
+
+        return np.nan
 
     if scoring_metric == "accuracy":
         pred = np.asarray(model.predict(X)).reshape(-1)
@@ -574,8 +623,14 @@ def make_objective(model_name):
             cv=cv,
             scoring=scoring_metric,
             n_jobs=1,
+            error_score="raise",
         )
-        mean_score = float(np.mean(scores))
+        if np.all(np.isnan(scores)):
+            raise ValueError(
+                f"All CV scores are NaN for model_name={model_name!r} "
+                f"with scoring_metric={scoring_metric!r}."
+            )
+        mean_score = float(np.nanmean(scores))
         trial.set_user_attr("cv_scores", scores.tolist())
         return mean_score
 
