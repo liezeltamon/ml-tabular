@@ -1,12 +1,17 @@
-# %% Select features for benchmark model inputs
+# %% Select features particularly when dealing with high-dimensional data with high degree of correlation
 # env: ml-tabular-env
+
 # sbatch -J select_features_progb_vs_nonprogb -p short,long --mem=50G --output=logs/%x.log.out --error=logs/%x.log.err --wrap="python select_features.py --out-dir results/select_features/progb_vs_nonprogb --train-path /well/immune-rep/users/yfg436/git/sle/results/prediction/create_input_table/group_id_nonprogb_progb_missingness0_minuniqueNone/train.csv --test-path /well/immune-rep/users/yfg436/git/sle/results/prediction/create_input_table/group_id_nonprogb_progb_missingness0_minuniqueNone/test.csv"
+
+# sbatch -J select_features_progb_vs_nonprogb_selectkbest_p005 -p short,long --mem=50G --output=logs/%x.log.out --error=logs/%x.log.err --wrap="python select_features.py --out-dir results/select_features/progb_vs_nonprogb_selectkbest_p005 --train-path /well/immune-rep/users/yfg436/git/sle/results/prediction/create_input_table/group_id_nonprogb_progb_missingness0_minuniqueNone/train.csv --test-path /well/immune-rep/users/yfg436/git/sle/results/prediction/create_input_table/group_id_nonprogb_progb_missingness0_minuniqueNone/test.csv --univariate-method select_k_best --univariate-pvalue-threshold 0.05"
 
 import argparse
 import os
 import subprocess
 
 import pandas as pd
+
+from sklearn.feature_selection import SelectKBest, f_classif
 
 from feature_engine.selection import (
     DropConstantFeatures,
@@ -35,6 +40,12 @@ parser.add_argument("--correlation-threshold", type=float, default=0.8)
 parser.add_argument("--correlation-method", default="pearson")
 parser.add_argument("--smart-selection-method", default="variance")
 parser.add_argument("--skip-univariate-selection", action="store_true")
+parser.add_argument(
+    "--univariate-method",
+    choices=["select_k_best", "single_feature_performance"],
+    default="select_k_best",
+)
+parser.add_argument("--univariate-pvalue-threshold", type=float, default=0.05)
 parser.add_argument("--univariate-scoring", default="roc_auc")
 parser.add_argument("--univariate-cv", type=int, default=5)
 parser.add_argument("--univariate-threshold", type=float, default=None)
@@ -194,20 +205,96 @@ X_train_selection, duplicate_selector = fit_transform_train_selector(
 )
 
 univariate_selector = None
+univariate_feature_performance = pd.DataFrame(
+    columns=["feature", "score", "pvalue", "score_std", "selected", "method"]
+)
 if not args.skip_univariate_selection:
-    X_train_selection, univariate_selector = fit_transform_train_selector(
-        SelectBySingleFeaturePerformance(
-            estimator=LogisticRegression(max_iter=1000, solver="liblinear"),
-            scoring=args.univariate_scoring,
-            cv=args.univariate_cv,
-            threshold=args.univariate_threshold,
-        ),
-        X_train_selection,
-        "select_by_single_feature_performance",
-        summary_rows,
-        dropped_rows,
-        y_train=y_train,
-    )
+    if args.univariate_method == "select_k_best":
+        n_features_before = X_train_selection.shape[1]
+        univariate_selector = SelectKBest(score_func=f_classif, k="all")
+        univariate_selector.fit(X_train_selection, y_train)
+
+        scores = pd.Series(
+            univariate_selector.scores_,
+            index=X_train_selection.columns,
+            name="score",
+        )
+        pvalues = pd.Series(
+            univariate_selector.pvalues_,
+            index=X_train_selection.columns,
+            name="pvalue",
+        )
+        selected_features_univariate = pvalues[
+            pvalues < args.univariate_pvalue_threshold
+        ].index.tolist()
+        if len(selected_features_univariate) == 0:
+            raise ValueError(
+                "No features passed SelectKBest p-value threshold "
+                f"{args.univariate_pvalue_threshold}"
+            )
+
+        features_to_drop = [
+            feature
+            for feature in X_train_selection.columns
+            if feature not in selected_features_univariate
+        ]
+        dropped_rows.extend(
+            {"feature": feature, "step": "select_k_best_pvalue"}
+            for feature in features_to_drop
+        )
+        X_train_selection = X_train_selection[selected_features_univariate]
+        n_features_after = X_train_selection.shape[1]
+        summary_rows.append(
+            {
+                "step": "select_k_best_pvalue",
+                "n_features_before": n_features_before,
+                "n_features_after": n_features_after,
+                "n_dropped": n_features_before - n_features_after,
+            }
+        )
+        univariate_feature_performance = pd.DataFrame(
+            {
+                "feature": scores.index,
+                "score": scores.values,
+                "pvalue": pvalues.values,
+                "score_std": pd.NA,
+                "selected": scores.index.isin(selected_features_univariate),
+                "method": "select_k_best",
+            }
+        )
+    else:
+        X_train_selection, univariate_selector = fit_transform_train_selector(
+            SelectBySingleFeaturePerformance(
+                estimator=LogisticRegression(max_iter=1000, solver="liblinear"),
+                scoring=args.univariate_scoring,
+                cv=args.univariate_cv,
+                threshold=args.univariate_threshold,
+            ),
+            X_train_selection,
+            "select_by_single_feature_performance",
+            summary_rows,
+            dropped_rows,
+            y_train=y_train,
+        )
+        univariate_selected_features = set(univariate_selector.variables_) - set(
+            univariate_selector.features_to_drop_
+        )
+        univariate_feature_performance = pd.DataFrame(
+            {
+                "feature": list(univariate_selector.feature_performance_.keys()),
+                "score": list(univariate_selector.feature_performance_.values()),
+                "pvalue": pd.NA,
+                "score_std": [
+                    univariate_selector.feature_performance_std_.get(feature)
+                    for feature in univariate_selector.feature_performance_.keys()
+                ],
+                "selected": [
+                    feature in univariate_selected_features
+                    for feature in univariate_selector.feature_performance_.keys()
+                ],
+                "method": "single_feature_performance",
+            }
+        )
 
 correlated_selector = None
 if not args.skip_correlated_selection:
@@ -260,27 +347,9 @@ pd.DataFrame(dropped_rows, columns=["feature", "step"]).to_csv(
     index=False,
 )
 
-if univariate_selector is None:
-    univariate_feature_performance = pd.DataFrame(
-        columns=["feature", "score", "score_std", "selected"]
-    )
-else:
-    univariate_selected_features = set(univariate_selector.variables_) - set(
-        univariate_selector.features_to_drop_
-    )
-    univariate_feature_performance = pd.DataFrame(
-        {
-            "feature": list(univariate_selector.feature_performance_.keys()),
-            "score": list(univariate_selector.feature_performance_.values()),
-            "score_std": [
-                univariate_selector.feature_performance_std_.get(feature)
-                for feature in univariate_selector.feature_performance_.keys()
-            ],
-        }
-    )
-    univariate_feature_performance["selected"] = univariate_feature_performance[
-        "feature"
-    ].isin(univariate_selected_features)
+univariate_feature_performance = univariate_feature_performance[
+    ["feature", "score", "pvalue", "score_std", "selected", "method"]
+]
 univariate_feature_performance.to_csv(
     os.path.join(args.out_dir, "univariate_feature_performance.csv"),
     index=False,
