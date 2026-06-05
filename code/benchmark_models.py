@@ -1,25 +1,70 @@
 # %% Benchmark model architectures
 # env: ml-tabular-env
-#sbatch -J benchmark_models -p short,long --mem=50G --output=%x.log.out --error=%x.log.err --wrap="python benchmark_models.py"
+# sbatch -J benchmark_models_progb_vs_nonprogb_selected_models -p short,long --mem=50G --output=logs/%x.log.out --error=logs/%x.log.err --wrap="python benchmark_models.py --out-dir results/benchmark_models/progb_vs_nonprogb_selected_models"
+# sbatch -J gpu_benchmark_models_progb_vs_nonprogb_include_tree_based -p gpu_interactive --gres gpu:1 --output=logs/%x.log.out --error=logs/%x.log.err --wrap="python benchmark_models.py --out-dir results/benchmark_models/progb_vs_nonprogb_selected_models_include_tree_based_gpu --use-gpu"
+# sbatch -J benchmark_models_progb_vs_nonprogb_include_tree_based -p long --mem=50G --output=logs/%x.log.out --error=logs/%x.log.err --wrap="python benchmark_models.py --out-dir results/benchmark_models/progb_vs_nonprogb_selected_models_include_tree_based --use-gpu"
 
+import argparse
 import os
+import subprocess
+import time
+
 import pandas as pd
 
 from lazypredict.Supervised import LazyClassifier
 
+from sklearn.svm import LinearSVC
+from sklearn.linear_model import LogisticRegression, SGDClassifier, RidgeClassifier,  RidgeClassifierCV
+from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
+from sklearn.dummy import DummyClassifier
+
+import xgboost
+import lightgbm
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.tree import DecisionTreeClassifier
+
+os.chdir(
+    subprocess.check_output(
+        ["git", "rev-parse", "--show-toplevel"],
+        universal_newlines=True,
+    ).strip()
+)
+
 # %% Parameters
 
-benchmark_method = "lazypredict"  # "lazypredict" or "flaml"
+parser = argparse.ArgumentParser()
+parser.add_argument(
+    "--out-dir",
+    default="results/benchmark_models/",
+    help="Output directory for benchmark result CSVs.",
+)
+parser.add_argument(
+    "--use-gpu",
+    action="store_true",
+    help="Whether to use GPU acceleration for supported models (only for lazypredict).",
+)
+args = parser.parse_args()
+
+benchmark_method = "lazypredict"    # "lazypredict" or "flaml"
 lazypredict_sorter_key = "ROC AUC"  # "Accuracy", "Balanced Accuracy", "ROC AUC", "F1 Score", "Time Taken"
-target_column = "label"
+categorical_encoder = "onehot" # "onehot", "ordinal", "target", "binary"
+classifiers = [
+    LinearSVC, LogisticRegression, SGDClassifier, RidgeClassifier, RidgeClassifierCV, LinearDiscriminantAnalysis,
+    RandomForestClassifier, xgboost.XGBClassifier, lightgbm.LGBMClassifier,
+    #RandomForestClassifier, DecisionTreeClassifier GradientBoostingClassifier,
+    DummyClassifier,
+] # "all" to use all available classifiers, or a list of specific classifiers to benchmark (e.g. [RandomForestClassifier, DecisionTreeClassifier])
+use_gpu = args.use_gpu  # Only for lazypredict and supported models, not for flaml
 
-train_path = "../data/train.csv"
-test_path = "../data/test.csv"
+target_column = "is_progb" #"label"
+train_path = "/well/immune-rep/users/yfg436/git/sle/results/prediction/create_input_table/group_id_nonprogb_progb_missingness0_minuniqueNone/train.csv" #"data/train.csv"
+test_path = "/well/immune-rep/users/yfg436/git/sle/results/prediction/create_input_table/group_id_nonprogb_progb_missingness0_minuniqueNone/test.csv" #"data/test.csv"
 
-out_dir = "../results/benchmark_models"
-os.makedirs(out_dir, exist_ok=True)
+out_dir = args.out_dir
 
 # %% ----- MAIN -----
+
+os.makedirs(out_dir, exist_ok=True)
 
 # %% Load data
 
@@ -35,16 +80,39 @@ y_test = test_df[target_column]
 # %% Benchmark models
 
 if benchmark_method == "lazypredict":
-    clf = LazyClassifier(verbose=0, ignore_warnings=True, custom_metric=None)
+
+    clf = LazyClassifier(
+        verbose=1,                          # Show progress
+        ignore_warnings=True,               # Suppress warnings
+        custom_metric=None,                 # Use default metrics
+        predictions=True,                   # Return predictions
+        # See https://github.com/shankarpandala/lazypredict/issues/346 to pass custom classifiers
+        # e.g. classifiers=[RandomForestClassifier, DecisionTreeClassifier]
+        classifiers=classifiers,            # List of classifiers to benchmark (default: all available)
+        categorical_encoder=categorical_encoder, # Encoding: "onehot" (default), "ordinal", "target", "binary"
+        timeout=60,                         # Max time per model in seconds
+        cv=5,                               # Cross-validation folds (optional)
+        use_gpu=use_gpu                     # Enable GPU acceleration
+    )
+    lazypredict_start_time = time.perf_counter()
+    print("Starting LazyPredict fit...", flush=True)
     models, predictions = clf.fit(X_train, X_test, y_train, y_test)
+    lazypredict_elapsed_seconds = time.perf_counter() - lazypredict_start_time
+    print(
+        f"LazyPredict fit completed in {lazypredict_elapsed_seconds:.2f} seconds "
+        f"({lazypredict_elapsed_seconds / 60:.2f} minutes).",
+        flush=True,
+    )
 
-    models = models.sort_values(by="ROC AUC", ascending=False)
+    # Save model x performance metrics
     models = models.sort_values(by=lazypredict_sorter_key, ascending=False)
-
     print(models)
     models.reset_index().to_csv(
         os.path.join(out_dir, "lazypredict_results.csv"), index=False
     )
+
+    # Save predictions (sample x model)
+    predictions.to_csv(os.path.join(out_dir, "lazypredict_predictions.csv"), index=False)
 
 elif benchmark_method == "flaml":
     raise NotImplementedError(
