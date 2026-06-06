@@ -5,8 +5,11 @@ This repository provides a workflow for applying machine learning to tabular dat
 ## Workflow
 
 - `benchmark_models.py` screens candidate model families and compares baseline performance to identify strong model architectures.
-- `tune_models.py` tunes shortlisted models with Optuna, selects the best-performing model, calibrates probabilities, and saves the final model and run outputs.
-- `explain_model.py` generates SHAP-based explanations to identify important features and to assess whether learned feature-prediction relationships are consistent with prior knowledge.
+- `select_features.py` selects features from labeled train and test tables, with optional one-run bootstrapping of training rows.
+- `run_select_features_bootstrap_array.sh` runs repeated bootstrapped feature-selection replicates as a Slurm array.
+- `summarise_bootstrap_features.py` summarises bootstrap-selected features, applies a selection-frequency threshold, and writes final reduced train and test tables.
+- `tune_models.py` tunes shortlisted models with Optuna, selects the best-performing model, saves final uncalibrated and calibrated models, and saves best-parameter uncalibrated CV fold models for downstream explanation.
+- `explain_model.py` generates SHAP-based explanations from either a single `--model-path` or a fold-model directory for averaged SHAP explanations.
 
 ## Data contract
 
@@ -20,8 +23,8 @@ This repository provides a workflow for applying machine learning to tabular dat
 
 - scikit-learn pipelines for preprocessing and model workflows
 - Optuna for automated hyperparameter tuning
-- MLflow for experiment tracking
-- SHAP for feature-level explanations
+- MLflow for tracking tuned models, fold models, metrics, and artifacts
+- SHAP for single-model and fold-averaged feature-level explanations
 
 ## Potential applications
 
