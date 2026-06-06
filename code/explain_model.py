@@ -1,14 +1,15 @@
 # sbatch -J explain_model -p long --mem=100G --output=%x.log.out --error=%x.log.err --wrap="python explain_model.py --model-path final_model_calibrated.pkl --data-path ../data/test.csv --label-column label --out-dir ../results/explain_model/test_data --max-samples 1000000"
 
+# sbatch -J explain_model_lda_progb_vs_nonprogb_selectkbest_p005_top5 -p long --mem=100G --output=logs/%x.log.out --error=logs/%x.log.err --wrap="python explain_model.py --model-path results/tune_models/progb_vs_nonprogb_selectkbest_p005_top5/final_model_uncalibrated.pkl --data-path results/select_features/progb_vs_nonprogb_selectkbest_p005/test.csv --background-data-path results/select_features/progb_vs_nonprogb_selectkbest_p005/train.csv --label-column is_progb --out-dir results/explain_model/progb_vs_nonprogb_selectkbest_p005_top5/uncalibrated --max-samples 0 --max-background-samples 0"
+
 import argparse
+import joblib
+import os
+import subprocess
 from pathlib import Path
 
-import joblib
-
 import matplotlib
-
 matplotlib.use("Agg")
-
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -17,6 +18,12 @@ import shap
 from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
 
+os.chdir(
+    subprocess.check_output(
+        ["git", "rev-parse", "--show-toplevel"],
+        universal_newlines=True,
+    ).strip()
+)
 
 # %% Parameters and defaults
 
@@ -26,6 +33,19 @@ SUPPORTED_ESTIMATOR_NAMES = {
     "ExtraTreesClassifier",
     "CatBoostClassifier",
     "XGBClassifier",
+    "LinearDiscriminantAnalysis",
+}
+
+TREE_EXPLAINER_ESTIMATOR_NAMES = {
+    "LGBMClassifier",
+    "RandomForestClassifier",
+    "ExtraTreesClassifier",
+    "CatBoostClassifier",
+    "XGBClassifier",
+}
+
+LINEAR_EXPLAINER_ESTIMATOR_NAMES = {
+    "LinearDiscriminantAnalysis",
 }
 
 
@@ -61,12 +81,90 @@ def normalize_shap_values(shap_values, n_classes):
     return [np.asarray(class_values) for class_values in normalized]
 
 
+def select_row_aligned_shap_values(shap_by_class, class_labels, row_labels):
+    class_to_idx = {class_label: idx for idx, class_label in enumerate(class_labels)}
+    row_labels = np.asarray(row_labels)
+
+    missing_labels = pd.Index(row_labels).difference(pd.Index(class_labels))
+    if len(missing_labels) > 0:
+        missing = ", ".join(map(str, missing_labels))
+        raise ValueError(f"Could not find SHAP values for labels: {missing}")
+
+    n_rows = len(row_labels)
+    n_features = shap_by_class[0].shape[1]
+    row_shap_values = np.empty((n_rows, n_features))
+
+    for class_label, class_idx in class_to_idx.items():
+        class_mask = row_labels == class_label
+        if np.any(class_mask):
+            row_shap_values[class_mask] = shap_by_class[class_idx][class_mask]
+
+    return row_shap_values
+
+
 def sanitize_label(value):
     sanitized = "".join(
         char if char.isalnum() or char in {"-", "_"} else "_"
         for char in str(value)
     )
     return sanitized.strip("_") or "class"
+
+
+def to_dense_array(values):
+    if hasattr(values, "toarray"):
+        return values.toarray()
+    return np.asarray(values)
+
+
+def select_sample_indices(row_labels, max_samples, random_state):
+    all_indices = np.arange(len(row_labels))
+    if max_samples is None or max_samples <= 0 or len(row_labels) <= max_samples:
+        return all_indices
+
+    unique_classes, class_counts = np.unique(row_labels, return_counts=True)
+    can_stratify = len(unique_classes) > 1 and np.all(class_counts >= 2)
+
+    if can_stratify:
+        try:
+            sample_indices, _ = train_test_split(
+                all_indices,
+                train_size=max_samples,
+                random_state=random_state,
+                stratify=row_labels,
+            )
+            return np.sort(sample_indices)
+        except ValueError:
+            pass
+
+    rng = np.random.default_rng(random_state)
+    return np.sort(rng.choice(all_indices, size=max_samples, replace=False))
+
+
+def load_background_data(background_data_path, label_column, reference_columns):
+    background_df = pd.read_csv(background_data_path, index_col=0)
+
+    if label_column in background_df.columns:
+        background_df = background_df.drop(columns=[label_column])
+
+    if list(background_df.columns) != list(reference_columns):
+        raise ValueError(
+            "Background feature columns must exactly match explanation data columns."
+        )
+
+    return background_df
+
+
+def build_explainer(estimator, estimator_name, X_transformed_background):
+    if estimator_name in TREE_EXPLAINER_ESTIMATOR_NAMES:
+        return shap.TreeExplainer(estimator), "TreeExplainer"
+
+    if estimator_name in LINEAR_EXPLAINER_ESTIMATOR_NAMES:
+        return (
+            shap.LinearExplainer(estimator, X_transformed_background),
+            "LinearExplainer",
+        )
+
+    raise ValueError(f"Unsupported estimator '{estimator_name}'.")
 
 
 def save_heatmap(heatmap_df, output_path, title):
@@ -221,6 +319,143 @@ def save_dependence_grid(plot_items, output_path):
     fig.savefig(output_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
 
+
+def save_category_outputs(
+    category_label,
+    safe_label,
+    category_shap_values,
+    category_feature_df,
+    raw_feature_names,
+    display_feature_names,
+    top_features,
+    heatmap_top_features,
+    tables_dir,
+    bars_dir,
+    beeswarms_dir,
+    dependence_dir,
+):
+    if category_shap_values.shape[0] == 0:
+        pd.DataFrame(
+            columns=[
+                "raw_feature",
+                "display_feature",
+                "mean_abs_shap",
+                "mean_shap",
+            ]
+        ).to_csv(tables_dir / f"{safe_label}__top_features.csv", index=False)
+        return {
+            "heatmap_features": [],
+            "heatmap_row": pd.Series(dtype=float, name=str(category_label)),
+            "bar_grid_item": None,
+            "beeswarm_grid_item": None,
+        }
+
+    summary_df = pd.DataFrame(
+        {
+            "raw_feature": raw_feature_names,
+            "display_feature": display_feature_names,
+            "mean_abs_shap": np.mean(np.abs(category_shap_values), axis=0),
+            "mean_shap": np.mean(category_shap_values, axis=0),
+        }
+    ).sort_values("mean_abs_shap", ascending=False).reset_index(drop=True)
+
+    summary_df.to_csv(
+        tables_dir / f"{safe_label}__top_features.csv",
+        index=False,
+    )
+
+    plot_df = summary_df.head(top_features).iloc[::-1]
+    bar_grid_item = {
+        "class_label": category_label,
+        "plot_df": plot_df,
+    }
+    fig, ax = plt.subplots(figsize=(8, max(4, 0.55 * len(plot_df) + 1)))
+    ax.barh(
+        plot_df["display_feature"],
+        plot_df["mean_abs_shap"],
+        color="steelblue",
+    )
+    ax.set_xlabel("Mean |SHAP|")
+    ax.set_ylabel("Feature")
+    ax.set_title(f"{category_label}: top features")
+    fig.tight_layout()
+    fig.savefig(bars_dir / f"{safe_label}__bar.png", dpi=300)
+    plt.close(fig)
+
+    plt.figure(figsize=(8, max(4, 0.55 * top_features + 1)))
+    shap.summary_plot(
+        category_shap_values,
+        category_feature_df,
+        max_display=top_features,
+        show=False,
+    )
+    plt.title(f"{category_label}: SHAP distribution")
+    plt.tight_layout()
+    plt.savefig(
+        beeswarms_dir / f"{safe_label}__beeswarm.png",
+        dpi=300,
+        bbox_inches="tight",
+    )
+    plt.close()
+
+    beeswarm_grid_item = {
+        "class_label": category_label,
+        "class_shap_values": category_shap_values,
+        "class_feature_df": category_feature_df,
+    }
+
+    dependence_feature_names = summary_df.head(top_features)[
+        "display_feature"
+    ].tolist()
+    dependence_grid_items = []
+
+    for feature_name in dependence_feature_names:
+        safe_feature = sanitize_label(feature_name)
+
+        dependence_grid_items.append(
+            {
+                "feature_name": feature_name,
+                "class_shap_values": category_shap_values,
+                "class_feature_df": category_feature_df,
+            }
+        )
+
+        fig, ax = plt.subplots(figsize=(6.2, 4.8))
+        shap.dependence_plot(
+            feature_name,
+            category_shap_values,
+            category_feature_df,
+            interaction_index="auto",
+            ax=ax,
+            show=False,
+        )
+        ax.set_title(f"{category_label}: {feature_name}", fontsize=10)
+        ax.tick_params(axis="both", labelsize=8)
+        ax.set_xlabel(ax.get_xlabel(), fontsize=9)
+        ax.set_ylabel(ax.get_ylabel(), fontsize=9)
+        fig.tight_layout()
+        fig.savefig(
+            dependence_dir / f"{safe_label}__dependence__{safe_feature}.png",
+            dpi=300,
+            bbox_inches="tight",
+        )
+        plt.close(fig)
+
+    save_dependence_grid(
+        dependence_grid_items,
+        dependence_dir / f"{safe_label}__dependence_grid.png",
+    )
+
+    heatmap_top_df = summary_df.head(heatmap_top_features)
+    return {
+        "heatmap_features": heatmap_top_df["raw_feature"].tolist(),
+        "heatmap_row": heatmap_top_df.set_index("raw_feature")[
+            "mean_abs_shap"
+        ].rename(str(category_label)),
+        "bar_grid_item": bar_grid_item,
+        "beeswarm_grid_item": beeswarm_grid_item,
+    }
+
 # %% Argument parsing
 
 script_dir = Path(__file__).resolve().parent
@@ -237,6 +472,14 @@ parser.add_argument(
     "--data-path",
     default=str(script_dir.parent / "data" / "test.csv"),
     help="Path to the labeled CSV used for explanation.",
+)
+parser.add_argument(
+    "--background-data-path",
+    default=None,
+    help=(
+        "Optional CSV used as SHAP background/reference data for linear "
+        "explainers. If it contains the label column, that column is dropped."
+    ),
 )
 parser.add_argument(
     "--label-column",
@@ -267,6 +510,15 @@ parser.add_argument(
     help="Maximum number of rows used for SHAP computation.",
 )
 parser.add_argument(
+    "--max-background-samples",
+    type=int,
+    default=0,
+    help=(
+        "Maximum number of background rows used for linear SHAP. "
+        "Values <= 0 use all background rows."
+    ),
+)
+parser.add_argument(
     "--random-state",
     type=int,
     default=123,
@@ -278,6 +530,11 @@ args = parser.parse_args()
 
 model_path = Path(args.model_path).resolve()
 data_path = Path(args.data_path).resolve()
+background_data_path = (
+    Path(args.background_data_path).resolve()
+    if args.background_data_path is not None
+    else None
+)
 
 if args.out_dir is not None:
     out_dir = Path(args.out_dir).resolve()
@@ -288,6 +545,8 @@ if not model_path.exists():
     raise FileNotFoundError(f"Model file not found: {model_path}")
 if not data_path.exists():
     raise FileNotFoundError(f"Data file not found: {data_path}")
+if background_data_path is not None and not background_data_path.exists():
+    raise FileNotFoundError(f"Background data file not found: {background_data_path}")
 
 out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -338,32 +597,11 @@ y_pred = pipeline.predict(X)
 y_proba = pipeline.predict_proba(X)
 predicted_probabilities = y_proba.max(axis=1)
 
-all_indices = np.arange(len(y_true))
-if args.max_samples is None or args.max_samples <= 0 or len(y_true) <= args.max_samples:
-    sample_indices = all_indices
-else:
-    unique_classes, class_counts = np.unique(y_true, return_counts=True)
-    can_stratify = len(unique_classes) > 1 and np.all(class_counts >= 2)
-
-    if can_stratify:
-        try:
-            sample_indices, _ = train_test_split(
-                all_indices,
-                train_size=args.max_samples,
-                random_state=args.random_state,
-                stratify=y_true,
-            )
-            sample_indices = np.sort(sample_indices)
-        except ValueError:
-            rng = np.random.default_rng(args.random_state)
-            sample_indices = np.sort(
-                rng.choice(all_indices, size=args.max_samples, replace=False)
-            )
-    else:
-        rng = np.random.default_rng(args.random_state)
-        sample_indices = np.sort(
-            rng.choice(all_indices, size=args.max_samples, replace=False)
-        )
+sample_indices = select_sample_indices(
+    y_true,
+    max_samples=args.max_samples,
+    random_state=args.random_state,
+)
 
 X_sample = X.iloc[sample_indices].copy()
 y_true_sample = y_true.iloc[sample_indices].reset_index(drop=True)
@@ -373,11 +611,7 @@ y_pred_sample = (
 
 # %% Preprocessing and SHAP computation
 
-X_transformed_sample = feature_transformer.transform(X_sample)
-if hasattr(X_transformed_sample, "toarray"):
-    X_transformed_sample = X_transformed_sample.toarray()
-else:
-    X_transformed_sample = np.asarray(X_transformed_sample)
+X_transformed_sample = to_dense_array(feature_transformer.transform(X_sample))
 
 try:
     raw_feature_names = feature_transformer.get_feature_names_out()
@@ -408,13 +642,48 @@ if X_transformed_sample.shape[1] != len(raw_feature_names):
     )
 
 class_labels = np.asarray(estimator.classes_)
-explainer = shap.TreeExplainer(estimator)
+if estimator_name in LINEAR_EXPLAINER_ESTIMATOR_NAMES:
+    if background_data_path is None:
+        X_transformed_background = X_transformed_sample
+        background_source = "sampled explanation data"
+    else:
+        X_background = load_background_data(
+            background_data_path,
+            label_column=args.label_column,
+            reference_columns=X.columns,
+        )
+        background_indices = select_sample_indices(
+            np.zeros(len(X_background)),
+            max_samples=args.max_background_samples,
+            random_state=args.random_state,
+        )
+        X_background = X_background.iloc[background_indices].copy()
+        X_transformed_background = to_dense_array(
+            feature_transformer.transform(X_background)
+        )
+        background_source = str(background_data_path)
+else:
+    X_transformed_background = None
+    background_source = None
+
+if (
+    X_transformed_background is not None
+    and X_transformed_background.shape[1] != X_transformed_sample.shape[1]
+):
+    raise ValueError(
+        "The transformed background matrix width does not match the explanation matrix."
+    )
+
+explainer, explainer_name = build_explainer(
+    estimator,
+    estimator_name,
+    X_transformed_background,
+)
 shap_by_class = normalize_shap_values(
     explainer.shap_values(X_transformed_sample),
     n_classes=len(class_labels),
 )
 
-# Keep the sampled rows aligned across SHAP, predictions, and plots.
 sample_feature_df = pd.DataFrame(
     X_transformed_sample,
     columns=display_feature_names,
@@ -474,141 +743,87 @@ for grouping_name, group_labels in group_configs:
     bar_grid_items = []
     beeswarm_grid_items = []
 
+    overall_shap_values = select_row_aligned_shap_values(
+        shap_by_class,
+        class_labels,
+        group_labels,
+    )
+    overall_outputs = save_category_outputs(
+        category_label="Overall",
+        safe_label="overall",
+        category_shap_values=overall_shap_values,
+        category_feature_df=sample_feature_df,
+        raw_feature_names=raw_feature_names,
+        display_feature_names=display_feature_names,
+        top_features=args.top_features,
+        heatmap_top_features=args.heatmap_top_features_per_class,
+        tables_dir=tables_dir,
+        bars_dir=bars_dir,
+        beeswarms_dir=beeswarms_dir,
+        dependence_dir=dependence_dir,
+    )
+    heatmap_feature_union.extend(overall_outputs["heatmap_features"])
+    heatmap_rows.append(overall_outputs["heatmap_row"])
+    if overall_outputs["bar_grid_item"] is not None:
+        bar_grid_items.append(overall_outputs["bar_grid_item"])
+    if overall_outputs["beeswarm_grid_item"] is not None:
+        beeswarm_grid_items.append(overall_outputs["beeswarm_grid_item"])
+
     for class_idx, class_label in enumerate(class_labels):
         class_mask = np.asarray(group_labels == class_label)
         safe_label = sanitize_label(class_label)
 
         if not np.any(class_mask):
-            pd.DataFrame(
-                columns=[
-                    "raw_feature",
-                    "display_feature",
-                    "mean_abs_shap",
-                    "mean_shap",
-                ]
-            ).to_csv(tables_dir / f"{safe_label}__top_features.csv", index=False)
-            heatmap_rows.append(pd.Series(dtype=float, name=str(class_label)))
+            empty_outputs = save_category_outputs(
+                category_label=class_label,
+                safe_label=safe_label,
+                category_shap_values=shap_by_class[class_idx][class_mask],
+                category_feature_df=sample_feature_df.iloc[class_mask],
+                raw_feature_names=raw_feature_names,
+                display_feature_names=display_feature_names,
+                top_features=args.top_features,
+                heatmap_top_features=args.heatmap_top_features_per_class,
+                tables_dir=tables_dir,
+                bars_dir=bars_dir,
+                beeswarms_dir=beeswarms_dir,
+                dependence_dir=dependence_dir,
+            )
+            heatmap_rows.append(empty_outputs["heatmap_row"])
             continue
 
         class_shap_values = shap_by_class[class_idx][class_mask]
         class_feature_df = sample_feature_df.iloc[class_mask]
 
-        summary_df = pd.DataFrame(
-            {
-                "raw_feature": raw_feature_names,
-                "display_feature": display_feature_names,
-                "mean_abs_shap": np.mean(np.abs(class_shap_values), axis=0),
-                "mean_shap": np.mean(class_shap_values, axis=0),
-            }
-        ).sort_values("mean_abs_shap", ascending=False).reset_index(drop=True)
-
-        summary_df.head(args.top_features).to_csv(
-            tables_dir / f"{safe_label}__top_features.csv",
-            index=False,
+        class_outputs = save_category_outputs(
+            category_label=class_label,
+            safe_label=safe_label,
+            category_shap_values=class_shap_values,
+            category_feature_df=class_feature_df,
+            raw_feature_names=raw_feature_names,
+            display_feature_names=display_feature_names,
+            top_features=args.top_features,
+            heatmap_top_features=args.heatmap_top_features_per_class,
+            tables_dir=tables_dir,
+            bars_dir=bars_dir,
+            beeswarms_dir=beeswarms_dir,
+            dependence_dir=dependence_dir,
         )
-
-        plot_df = summary_df.head(args.top_features).iloc[::-1]
-        bar_grid_items.append(
-            {
-                "class_label": class_label,
-                "plot_df": plot_df,
-            }
-        )
-        fig, ax = plt.subplots(figsize=(8, max(4, 0.55 * len(plot_df) + 1)))
-        ax.barh(
-            plot_df["display_feature"],
-            plot_df["mean_abs_shap"],
-            color="steelblue",
-        )
-        ax.set_xlabel("Mean |SHAP|")
-        ax.set_ylabel("Feature")
-        ax.set_title(f"{class_label}: top features")
-        fig.tight_layout()
-        fig.savefig(bars_dir / f"{safe_label}__bar.png", dpi=300)
-        plt.close(fig)
-
-        plt.figure(figsize=(8, max(4, 0.55 * args.top_features + 1)))
-        shap.summary_plot(
-            class_shap_values,
-            class_feature_df,
-            max_display=args.top_features,
-            show=False,
-        )
-        plt.title(f"{class_label}: SHAP distribution")
-        plt.tight_layout()
-        plt.savefig(
-            beeswarms_dir / f"{safe_label}__beeswarm.png",
-            dpi=300,
-            bbox_inches="tight",
-        )
-        plt.close()
-
-        beeswarm_grid_items.append(
-            {
-                "class_label": class_label,
-                "class_shap_values": class_shap_values,
-                "class_feature_df": class_feature_df,
-            }
-        )
-
-        dependence_feature_names = summary_df.head(args.top_features)[
-            "display_feature"
-        ].tolist()
-        dependence_grid_items = []
-
-        for feature_name in dependence_feature_names:
-            safe_feature = sanitize_label(feature_name)
-
-            dependence_grid_items.append(
-                {
-                    "feature_name": feature_name,
-                    "class_shap_values": class_shap_values,
-                    "class_feature_df": class_feature_df,
-                }
-            )
-
-            fig, ax = plt.subplots(figsize=(6.2, 4.8))
-            shap.dependence_plot(
-                feature_name,
-                class_shap_values,
-                class_feature_df,
-                interaction_index="auto",
-                ax=ax,
-                show=False,
-            )
-            ax.set_title(f"{class_label}: {feature_name}", fontsize=10)
-            ax.tick_params(axis="both", labelsize=8)
-            ax.set_xlabel(ax.get_xlabel(), fontsize=9)
-            ax.set_ylabel(ax.get_ylabel(), fontsize=9)
-            fig.tight_layout()
-            fig.savefig(
-                dependence_dir / f"{safe_label}__dependence__{safe_feature}.png",
-                dpi=300,
-                bbox_inches="tight",
-            )
-            plt.close(fig)
-
-        save_dependence_grid(
-            dependence_grid_items,
-            dependence_dir / f"{safe_label}__dependence_grid.png",
-        )
-
-        # Use the union of each class's strongest features to build the heatmap.
-        heatmap_top_df = summary_df.head(args.heatmap_top_features_per_class)
-        heatmap_feature_union.extend(heatmap_top_df["raw_feature"].tolist())
-        heatmap_rows.append(
-            heatmap_top_df.set_index("raw_feature")["mean_abs_shap"].rename(
-                str(class_label)
-            )
-        )
+        heatmap_feature_union.extend(class_outputs["heatmap_features"])
+        heatmap_rows.append(class_outputs["heatmap_row"])
+        if class_outputs["bar_grid_item"] is not None:
+            bar_grid_items.append(class_outputs["bar_grid_item"])
+        if class_outputs["beeswarm_grid_item"] is not None:
+            beeswarm_grid_items.append(class_outputs["beeswarm_grid_item"])
 
     heatmap_features = pd.Index(heatmap_feature_union).unique()
     if len(heatmap_features) == 0:
-        heatmap_df = pd.DataFrame(index=[str(label) for label in class_labels])
+        heatmap_df = pd.DataFrame(
+            index=["Overall"] + [str(label) for label in class_labels]
+        )
     else:
         heatmap_df = pd.DataFrame(
             heatmap_rows,
-            index=[str(label) for label in class_labels],
+            index=["Overall"] + [str(label) for label in class_labels],
         ).reindex(columns=heatmap_features, fill_value=0.0)
         column_order = heatmap_df.max(axis=0).sort_values(ascending=False).index
         heatmap_df = heatmap_df.loc[:, column_order]
@@ -635,4 +850,10 @@ for grouping_name, group_labels in group_configs:
 
 # %% Final summary
 
+print(f"Estimator: {estimator_name}")
+print(f"SHAP explainer: {explainer_name}")
+print(f"Explained rows: {len(X_sample)}")
+if X_transformed_background is not None:
+    print(f"Background rows: {X_transformed_background.shape[0]}")
+    print(f"Background source: {background_source}")
 print(f"Saved explanation outputs to: {out_dir}")
