@@ -53,6 +53,11 @@ parser.add_argument("--univariate-threshold", type=float, default=None)
 parser.add_argument("--no-scale", dest="scale", action="store_false")
 parser.add_argument("--skip-correlated-selection", action="store_true")
 parser.add_argument(
+    "--write-reduced-data",
+    action="store_true",
+    help="Write train.csv and test.csv reduced to selected features.",
+)
+parser.add_argument(
     "--bootstrap-train",
     action="store_true",
     help="Sample train rows with replacement before feature selection.",
@@ -417,6 +422,35 @@ summary_df.to_csv(
     os.path.join(args.out_dir, "feature_selection_summary.csv"),
     index=False,
 )
+
+if args.write_reduced_data:
+    selected_features = selection_outputs["selected_features"]
+    output_columns = selected_features + [args.target_column]
+    original_train_features = train_df.drop(columns=[args.target_column]).columns
+    original_test_features = test_df.drop(columns=[args.target_column]).columns
+    missing_train_features = sorted(
+        set(selected_features).difference(original_train_features)
+    )
+    missing_test_features = sorted(
+        set(selected_features).difference(original_test_features)
+    )
+
+    if missing_train_features or missing_test_features:
+        missing_train_preview = ", ".join(missing_train_features[:10])
+        missing_test_preview = ", ".join(missing_test_features[:10])
+        raise ValueError(
+            "Selected features are missing from original input data. "
+            f"Train missing: {missing_train_preview or 'none'}. "
+            f"Test missing: {missing_test_preview or 'none'}."
+        )
+
+    train_df.loc[:, output_columns].to_csv(
+        os.path.join(args.out_dir, "train.csv"),
+    )
+    test_df.loc[:, output_columns].to_csv(
+        os.path.join(args.out_dir, "test.csv"),
+    )
+    print(f"Saved reduced train/test data to {args.out_dir}")
 
 print(summary_df)
 print(f"Selected features: {len(selection_outputs['selected_features'])}")
