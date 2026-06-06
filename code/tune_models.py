@@ -105,6 +105,9 @@ confidence_threshold_summary_path = os.path.join(
 )
 final_model_calibrated_path = os.path.join(out_dir, "final_model_calibrated.pkl")
 final_model_uncalibrated_path = os.path.join(out_dir, "final_model_uncalibrated.pkl")
+cv_fold_model_dir = os.path.join(out_dir, "cv_fold_models", "uncalibrated")
+cv_fold_model_summary_path = os.path.join(out_dir, "cv_fold_model_summary.csv")
+cv_fold_assignments_path = os.path.join(out_dir, "cv_fold_assignments.csv")
 plot_model_comparison_path = os.path.join(out_dir, "plot_model_comparison.png")
 plot_cv_score_spread_path = os.path.join(out_dir, "plot_cv_score_spread.png")
 plot_final_model_scores_path = os.path.join(out_dir, "plot_final_model_scores.png")
@@ -394,6 +397,85 @@ def compute_score(model, X, y, scoring_metric, num_classes):
         return accuracy_score(y, pred)
 
     return np.nan
+
+
+def save_best_param_cv_fold_models(
+    best_model_name,
+    best_params,
+    X_train,
+    y_train,
+    cv,
+    scoring_metric,
+    num_classes,
+    cv_fold_model_dir,
+    cv_fold_model_summary_path,
+    cv_fold_assignments_path,
+):
+    os.makedirs(cv_fold_model_dir, exist_ok=True)
+    summary_rows = []
+    assignment_rows = []
+
+    for fold_idx, (train_indices, validation_indices) in enumerate(
+        cv.split(X_train, y_train),
+        start=1,
+    ):
+        fold_pipeline = build_pipeline(
+            FixedTrial(best_params),
+            best_model_name,
+            fit_label=f"cv_fold_{fold_idx}",
+        )
+        X_fold_train = X_train.iloc[train_indices]
+        y_fold_train = y_train.iloc[train_indices]
+        X_fold_validation = X_train.iloc[validation_indices]
+        y_fold_validation = y_train.iloc[validation_indices]
+
+        fold_pipeline.fit(X_fold_train, y_fold_train)
+        validation_score = compute_score(
+            fold_pipeline,
+            X_fold_validation,
+            y_fold_validation,
+            scoring_metric=scoring_metric,
+            num_classes=num_classes,
+        )
+
+        model_path = os.path.join(cv_fold_model_dir, f"fold_{fold_idx}.pkl")
+        joblib.dump(fold_pipeline, model_path)
+
+        summary_rows.append(
+            {
+                "fold": fold_idx,
+                "model_path": model_path,
+                "model_family": best_model_name,
+                "scoring_metric": scoring_metric,
+                "validation_score": validation_score,
+                "n_train_rows": len(train_indices),
+                "n_validation_rows": len(validation_indices),
+            }
+        )
+
+        assignment_rows.extend(
+            {
+                "row_index": str(X_train.index[row_index]),
+                "fold": fold_idx,
+                "role": "train",
+            }
+            for row_index in train_indices
+        )
+        assignment_rows.extend(
+            {
+                "row_index": str(X_train.index[row_index]),
+                "fold": fold_idx,
+                "role": "validation",
+            }
+            for row_index in validation_indices
+        )
+
+    cv_fold_model_summary_df = pd.DataFrame(summary_rows)
+    cv_fold_assignments_df = pd.DataFrame(assignment_rows)
+    cv_fold_model_summary_df.to_csv(cv_fold_model_summary_path, index=False)
+    cv_fold_assignments_df.to_csv(cv_fold_assignments_path, index=False)
+
+    return cv_fold_model_summary_df, cv_fold_assignments_df
 
 
 def plot_model_comparison(results_df, scoring_metric, out_path):
@@ -713,6 +795,19 @@ best_lazy_name = results_df.iloc[0]["lazy_name"]
 best_study = studies[best_model_name]
 num_classes = len(np.unique(y_train))
 
+cv_fold_model_summary_df, cv_fold_assignments_df = save_best_param_cv_fold_models(
+    best_model_name=best_model_name,
+    best_params=best_study.best_params,
+    X_train=X_train,
+    y_train=y_train,
+    cv=cv,
+    scoring_metric=scoring_metric,
+    num_classes=num_classes,
+    cv_fold_model_dir=cv_fold_model_dir,
+    cv_fold_model_summary_path=cv_fold_model_summary_path,
+    cv_fold_assignments_path=cv_fold_assignments_path,
+)
+
 uncalibrated_final_pipeline = build_pipeline(
     FixedTrial(best_study.best_params),
     best_model_name,
@@ -836,10 +931,14 @@ with mlflow.start_run(run_name="final_model"):
     log_data_source_params()
     mlflow.log_param("winning_model_family", best_model_name)
     mlflow.log_param("winning_lazy_name", best_lazy_name)
+    mlflow.log_param("cv_folds", cv.get_n_splits())
+    mlflow.log_param("scoring_metric", scoring_metric)
     mlflow.log_param("calibration_method", "sigmoid")
     mlflow.log_param("calibration_cv_folds", cv.get_n_splits())
     mlflow.log_param("calibration_ensemble", False)
     mlflow.log_param("n_jobs", n_jobs)
+    for key, value in best_study.best_params.items():
+        mlflow.log_param(f"best_{key}", value)
     log_metric_if_valid("selection_cv_score", selection_cv_score)
     log_metric_if_valid("uncalibrated_test_score", uncalibrated_summary["score"])
     log_metric_if_valid("calibrated_test_score", calibrated_summary["score"])
@@ -850,6 +949,12 @@ with mlflow.start_run(run_name="final_model"):
 
     mlflow.log_artifact(final_model_calibrated_path)
     mlflow.log_artifact(final_model_uncalibrated_path)
+    mlflow.log_artifacts(
+        cv_fold_model_dir,
+        artifact_path="cv_fold_models_uncalibrated",
+    )
+    mlflow.log_artifact(cv_fold_model_summary_path)
+    mlflow.log_artifact(cv_fold_assignments_path)
     mlflow.log_artifact(optuna_comparison_path)
     mlflow.log_artifact(calibration_comparison_path)
     mlflow.log_artifact(calibration_bins_path)
@@ -871,6 +976,9 @@ print("Uncalibrated test ECE:", uncalibrated_summary["ece"])
 print("Calibrated test ECE:", calibrated_summary["ece"])
 print("Saved calibrated final model to", final_model_calibrated_path)
 print("Saved uncalibrated final model to", final_model_uncalibrated_path)
+print("Saved CV fold models to", cv_fold_model_dir)
+print("Saved CV fold model summary to", cv_fold_model_summary_path)
+print("Saved CV fold assignments to", cv_fold_assignments_path)
 print(
     f"Total runtime (seconds): {overall_duration:.2f} "
     f"({overall_duration / 60:.2f} minutes)"

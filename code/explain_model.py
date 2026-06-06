@@ -167,6 +167,82 @@ def build_explainer(estimator, estimator_name, X_transformed_background):
     raise ValueError(f"Unsupported estimator '{estimator_name}'.")
 
 
+def load_model_paths(model_path, model_dir, model_glob):
+    if model_path is not None:
+        return [Path(model_path).resolve()]
+
+    resolved_model_dir = Path(model_dir).resolve()
+    model_paths = sorted(resolved_model_dir.glob(model_glob))
+    if not model_paths:
+        raise FileNotFoundError(
+            f"No model files matched {model_glob!r} under {resolved_model_dir}."
+        )
+    return model_paths
+
+
+def get_pipeline_components(pipeline, model_path):
+    if not isinstance(pipeline, Pipeline):
+        raise TypeError(
+            f"Expected a fitted sklearn Pipeline saved with joblib: {model_path}"
+        )
+    if len(pipeline.steps) < 2:
+        raise ValueError(
+            f"Expected a pipeline with preprocessing steps and a final estimator: {model_path}"
+        )
+
+    estimator = pipeline.steps[-1][1]
+    estimator_name = estimator.__class__.__name__
+    feature_transformer = pipeline[:-1]
+
+    if estimator_name not in SUPPORTED_ESTIMATOR_NAMES:
+        supported = ", ".join(sorted(SUPPORTED_ESTIMATOR_NAMES))
+        raise ValueError(
+            f"Unsupported estimator '{estimator_name}' in {model_path}. "
+            f"Supported estimators: {supported}."
+        )
+    if not hasattr(estimator, "predict_proba"):
+        raise ValueError(
+            f"The final estimator in {model_path} must support predict_proba."
+        )
+    if not hasattr(estimator, "classes_"):
+        raise ValueError(
+            f"The final estimator in {model_path} appears unfitted because classes_ is missing."
+        )
+    if not hasattr(feature_transformer, "transform"):
+        raise ValueError(
+            f"The pipeline preprocessing block in {model_path} must support transform()."
+        )
+
+    return estimator, estimator_name, feature_transformer
+
+
+def get_transformed_feature_names(feature_transformer, X_sample, n_features):
+    try:
+        raw_feature_names = feature_transformer.get_feature_names_out()
+    except TypeError:
+        raw_feature_names = feature_transformer.get_feature_names_out(X_sample.columns)
+    except AttributeError:
+        raw_feature_names = np.array(
+            [f"feature_{i}" for i in range(n_features)]
+        )
+
+    raw_feature_names = np.asarray(raw_feature_names, dtype=str)
+    display_feature_names = np.array(
+        [
+            name.split("__", 1)[1] if "__" in name else name
+            for name in raw_feature_names
+        ],
+        dtype=str,
+    )
+
+    duplicate_mask = (
+        pd.Series(display_feature_names).duplicated(keep=False).to_numpy()
+    )
+    display_feature_names[duplicate_mask] = raw_feature_names[duplicate_mask]
+
+    return raw_feature_names, display_feature_names
+
+
 def save_heatmap(heatmap_df, output_path, title):
     n_rows, n_cols = heatmap_df.shape
     fig_width = max(8, 0.7 * n_cols + 3)
@@ -324,6 +400,8 @@ def save_category_outputs(
     category_label,
     safe_label,
     category_shap_values,
+    category_model_shap_values,
+    model_labels,
     category_feature_df,
     raw_feature_names,
     display_feature_names,
@@ -334,14 +412,27 @@ def save_category_outputs(
     beeswarms_dir,
     dependence_dir,
 ):
+    fold_mode = category_model_shap_values is not None and len(model_labels) > 1
+    base_columns = [
+        "raw_feature",
+        "display_feature",
+        "mean_abs_shap",
+        "mean_shap",
+    ]
+    fold_columns = []
+    if fold_mode:
+        fold_columns = [
+            f"{model_label}_mean_abs_shap"
+            for model_label in model_labels
+        ] + [
+            "mean_abs_shap_sd",
+            "mean_abs_shap_min",
+            "mean_abs_shap_max",
+        ]
+
     if category_shap_values.shape[0] == 0:
         pd.DataFrame(
-            columns=[
-                "raw_feature",
-                "display_feature",
-                "mean_abs_shap",
-                "mean_shap",
-            ]
+            columns=base_columns + fold_columns
         ).to_csv(tables_dir / f"{safe_label}__top_features.csv", index=False)
         return {
             "heatmap_features": [],
@@ -350,14 +441,40 @@ def save_category_outputs(
             "beeswarm_grid_item": None,
         }
 
+    if fold_mode:
+        fold_mean_abs_shap = np.vstack(
+            [
+                np.mean(np.abs(model_shap_values), axis=0)
+                for model_shap_values in category_model_shap_values
+            ]
+        )
+        mean_abs_shap = fold_mean_abs_shap.mean(axis=0)
+    else:
+        fold_mean_abs_shap = None
+        mean_abs_shap = np.mean(np.abs(category_shap_values), axis=0)
+
     summary_df = pd.DataFrame(
         {
             "raw_feature": raw_feature_names,
             "display_feature": display_feature_names,
-            "mean_abs_shap": np.mean(np.abs(category_shap_values), axis=0),
+            "mean_abs_shap": mean_abs_shap,
             "mean_shap": np.mean(category_shap_values, axis=0),
         }
-    ).sort_values("mean_abs_shap", ascending=False).reset_index(drop=True)
+    )
+
+    if fold_mode:
+        for model_idx, model_label in enumerate(model_labels):
+            summary_df[f"{model_label}_mean_abs_shap"] = fold_mean_abs_shap[
+                model_idx,
+            ]
+        summary_df["mean_abs_shap_sd"] = fold_mean_abs_shap.std(axis=0)
+        summary_df["mean_abs_shap_min"] = fold_mean_abs_shap.min(axis=0)
+        summary_df["mean_abs_shap_max"] = fold_mean_abs_shap.max(axis=0)
+
+    summary_df = summary_df.sort_values(
+        "mean_abs_shap",
+        ascending=False,
+    ).reset_index(drop=True)
 
     summary_df.to_csv(
         tables_dir / f"{safe_label}__top_features.csv",
@@ -463,10 +580,19 @@ script_dir = Path(__file__).resolve().parent
 parser = argparse.ArgumentParser(
     description="Explain class predictions from a saved sklearn pipeline with SHAP."
 )
-parser.add_argument(
+model_input_group = parser.add_mutually_exclusive_group(required=True)
+model_input_group.add_argument(
     "--model-path",
-    required=True,
     help="Path to a saved joblib pipeline such as final_model_calibrated.pkl.",
+)
+model_input_group.add_argument(
+    "--model-dir",
+    help="Directory containing saved fold model pipelines.",
+)
+parser.add_argument(
+    "--model-glob",
+    default="fold_*.pkl",
+    help="Glob used with --model-dir to select saved fold model pipelines.",
 )
 parser.add_argument(
     "--data-path",
@@ -528,7 +654,7 @@ args = parser.parse_args()
 
 # %% Path resolution and validation
 
-model_path = Path(args.model_path).resolve()
+model_paths = load_model_paths(args.model_path, args.model_dir, args.model_glob)
 data_path = Path(args.data_path).resolve()
 background_data_path = (
     Path(args.background_data_path).resolve()
@@ -538,11 +664,14 @@ background_data_path = (
 
 if args.out_dir is not None:
     out_dir = Path(args.out_dir).resolve()
+elif args.model_path is not None:
+    out_dir = script_dir.parent / "results" / "explain_model" / model_paths[0].stem
 else:
-    out_dir = script_dir.parent / "results" / "explain_model" / model_path.stem
+    out_dir = script_dir.parent / "results" / "explain_model" / model_paths[0].parent.name
 
-if not model_path.exists():
-    raise FileNotFoundError(f"Model file not found: {model_path}")
+for model_path in model_paths:
+    if not model_path.exists():
+        raise FileNotFoundError(f"Model file not found: {model_path}")
 if not data_path.exists():
     raise FileNotFoundError(f"Data file not found: {data_path}")
 if background_data_path is not None and not background_data_path.exists():
@@ -552,32 +681,41 @@ out_dir.mkdir(parents=True, exist_ok=True)
 
 # %% Model loading and estimator checks
 
-pipeline = joblib.load(model_path)
-
-if not isinstance(pipeline, Pipeline):
-    raise TypeError("Expected a fitted sklearn Pipeline saved with joblib.")
-if len(pipeline.steps) < 2:
-    raise ValueError(
-        "Expected a pipeline with preprocessing steps and a final estimator."
+model_records = []
+for model_path in model_paths:
+    pipeline = joblib.load(model_path)
+    estimator, estimator_name, feature_transformer = get_pipeline_components(
+        pipeline,
+        model_path,
+    )
+    model_records.append(
+        {
+            "path": model_path,
+            "label": sanitize_label(model_path.stem),
+            "pipeline": pipeline,
+            "estimator": estimator,
+            "estimator_name": estimator_name,
+            "feature_transformer": feature_transformer,
+        }
     )
 
-estimator = pipeline.steps[-1][1]
-estimator_name = estimator.__class__.__name__
-feature_transformer = pipeline[:-1]
+reference_record = model_records[0]
+estimator_name = reference_record["estimator_name"]
+class_labels = np.asarray(reference_record["estimator"].classes_)
+model_labels = [record["label"] for record in model_records]
+is_fold_model_mode = len(model_records) > 1
 
-if estimator_name not in SUPPORTED_ESTIMATOR_NAMES:
-    supported = ", ".join(sorted(SUPPORTED_ESTIMATOR_NAMES))
-    raise ValueError(
-        f"Unsupported estimator '{estimator_name}'. Supported estimators: {supported}."
-    )
-if not hasattr(estimator, "predict_proba"):
-    raise ValueError(
-        "The final estimator must support predict_proba for class-level explanation."
-    )
-if not hasattr(estimator, "classes_"):
-    raise ValueError("The final estimator appears unfitted because classes_ is missing.")
-if not hasattr(feature_transformer, "transform"):
-    raise ValueError("The pipeline preprocessing block must support transform().")
+for model_record in model_records[1:]:
+    if model_record["estimator_name"] != estimator_name:
+        raise ValueError(
+            "All fold models must use the same estimator type. "
+            f"Expected {estimator_name}, found {model_record['estimator_name']} "
+            f"in {model_record['path']}."
+        )
+    if not np.array_equal(np.asarray(model_record["estimator"].classes_), class_labels):
+        raise ValueError(
+            f"Class labels in {model_record['path']} do not match the first model."
+        )
 
 # %% Dataset loading
 
@@ -593,8 +731,16 @@ y_true = data_df[args.label_column]
 
 # %% Predictions and sampling
 
-y_pred = pipeline.predict(X)
-y_proba = pipeline.predict_proba(X)
+if is_fold_model_mode:
+    y_proba_by_model = [
+        model_record["pipeline"].predict_proba(X)
+        for model_record in model_records
+    ]
+    y_proba = np.mean(np.stack(y_proba_by_model, axis=0), axis=0)
+    y_pred = class_labels[np.argmax(y_proba, axis=1)]
+else:
+    y_pred = reference_record["pipeline"].predict(X)
+    y_proba = reference_record["pipeline"].predict_proba(X)
 predicted_probabilities = y_proba.max(axis=1)
 
 sample_indices = select_sample_indices(
@@ -611,77 +757,131 @@ y_pred_sample = (
 
 # %% Preprocessing and SHAP computation
 
-X_transformed_sample = to_dense_array(feature_transformer.transform(X_sample))
-
-try:
-    raw_feature_names = feature_transformer.get_feature_names_out()
-except TypeError:
-    raw_feature_names = feature_transformer.get_feature_names_out(X_sample.columns)
-except AttributeError:
-    raw_feature_names = np.array(
-        [f"feature_{i}" for i in range(X_transformed_sample.shape[1])]
+if estimator_name in LINEAR_EXPLAINER_ESTIMATOR_NAMES and background_data_path is not None:
+    X_background = load_background_data(
+        background_data_path,
+        label_column=args.label_column,
+        reference_columns=X.columns,
     )
-
-raw_feature_names = np.asarray(raw_feature_names, dtype=str)
-display_feature_names = np.array(
-    [
-        name.split("__", 1)[1] if "__" in name else name
-        for name in raw_feature_names
-    ],
-    dtype=str,
-)
-
-duplicate_mask = (
-    pd.Series(display_feature_names).duplicated(keep=False).to_numpy()
-)
-display_feature_names[duplicate_mask] = raw_feature_names[duplicate_mask]
-
-if X_transformed_sample.shape[1] != len(raw_feature_names):
-    raise ValueError(
-        "The transformed feature matrix width does not match the recovered feature names."
+    background_indices = select_sample_indices(
+        np.zeros(len(X_background)),
+        max_samples=args.max_background_samples,
+        random_state=args.random_state,
     )
-
-class_labels = np.asarray(estimator.classes_)
-if estimator_name in LINEAR_EXPLAINER_ESTIMATOR_NAMES:
-    if background_data_path is None:
-        X_transformed_background = X_transformed_sample
-        background_source = "sampled explanation data"
-    else:
-        X_background = load_background_data(
-            background_data_path,
-            label_column=args.label_column,
-            reference_columns=X.columns,
-        )
-        background_indices = select_sample_indices(
-            np.zeros(len(X_background)),
-            max_samples=args.max_background_samples,
-            random_state=args.random_state,
-        )
-        X_background = X_background.iloc[background_indices].copy()
-        X_transformed_background = to_dense_array(
-            feature_transformer.transform(X_background)
-        )
-        background_source = str(background_data_path)
+    X_background = X_background.iloc[background_indices].copy()
 else:
-    X_transformed_background = None
-    background_source = None
+    X_background = None
 
-if (
-    X_transformed_background is not None
-    and X_transformed_background.shape[1] != X_transformed_sample.shape[1]
-):
-    raise ValueError(
-        "The transformed background matrix width does not match the explanation matrix."
+X_transformed_sample_by_model = []
+shap_by_class_by_model = []
+explainer_names = []
+raw_feature_names = None
+display_feature_names = None
+background_source = None
+background_rows = None
+
+for model_record in model_records:
+    feature_transformer = model_record["feature_transformer"]
+    estimator = model_record["estimator"]
+    X_transformed_sample_model = to_dense_array(
+        feature_transformer.transform(X_sample)
+    )
+    model_raw_feature_names, model_display_feature_names = (
+        get_transformed_feature_names(
+            feature_transformer,
+            X_sample,
+            X_transformed_sample_model.shape[1],
+        )
     )
 
-explainer, explainer_name = build_explainer(
-    estimator,
-    estimator_name,
-    X_transformed_background,
+    if X_transformed_sample_model.shape[1] != len(model_raw_feature_names):
+        raise ValueError(
+            "The transformed feature matrix width does not match the recovered "
+            f"feature names for {model_record['path']}."
+        )
+
+    if raw_feature_names is None:
+        raw_feature_names = model_raw_feature_names
+        display_feature_names = model_display_feature_names
+    else:
+        if not np.array_equal(model_raw_feature_names, raw_feature_names):
+            raise ValueError(
+                f"Transformed feature names in {model_record['path']} do not match "
+                "the first model."
+            )
+
+    if estimator_name in LINEAR_EXPLAINER_ESTIMATOR_NAMES:
+        if X_background is None:
+            X_transformed_background = X_transformed_sample_model
+            background_source = "sampled explanation data"
+        else:
+            X_transformed_background = to_dense_array(
+                feature_transformer.transform(X_background)
+            )
+            background_source = str(background_data_path)
+        background_rows = X_transformed_background.shape[0]
+    else:
+        X_transformed_background = None
+
+    if (
+        X_transformed_background is not None
+        and X_transformed_background.shape[1] != X_transformed_sample_model.shape[1]
+    ):
+        raise ValueError(
+            "The transformed background matrix width does not match the explanation "
+            f"matrix for {model_record['path']}."
+        )
+
+    explainer, model_explainer_name = build_explainer(
+        estimator,
+        estimator_name,
+        X_transformed_background,
+    )
+    shap_by_class_model = normalize_shap_values(
+        explainer.shap_values(X_transformed_sample_model),
+        n_classes=len(class_labels),
+    )
+
+    X_transformed_sample_by_model.append(X_transformed_sample_model)
+    shap_by_class_by_model.append(shap_by_class_model)
+    explainer_names.append(model_explainer_name)
+
+X_transformed_sample = np.mean(
+    np.stack(X_transformed_sample_by_model, axis=0),
+    axis=0,
 )
-shap_by_class = normalize_shap_values(
-    explainer.shap_values(X_transformed_sample),
-    n_classes=len(class_labels),
+shap_by_class = [
+    np.mean(
+        np.stack(
+            [
+                model_shap_by_class[class_idx]
+                for model_shap_by_class in shap_by_class_by_model
+            ],
+            axis=0,
+        ),
+        axis=0,
+    )
+    for class_idx in range(len(class_labels))
+]
+explainer_name = explainer_names[0]
+
+if any(name != explainer_name for name in explainer_names):
+    raise ValueError(
+        "All fold models must use the same SHAP explainer type."
+    )
+
+pd.DataFrame(
+    {
+        "model_label": model_labels,
+        "model_path": [str(model_record["path"]) for model_record in model_records],
+        "estimator_name": [
+            model_record["estimator_name"] for model_record in model_records
+        ],
+        "explainer_name": explainer_names,
+    }
+).to_csv(
+    out_dir / "model_explainers.csv",
+    index=False,
 )
 
 sample_feature_df = pd.DataFrame(
@@ -748,10 +948,24 @@ for grouping_name, group_labels in group_configs:
         class_labels,
         group_labels,
     )
+    if is_fold_model_mode:
+        overall_model_shap_values = [
+            select_row_aligned_shap_values(
+                model_shap_by_class,
+                class_labels,
+                group_labels,
+            )
+            for model_shap_by_class in shap_by_class_by_model
+        ]
+    else:
+        overall_model_shap_values = None
+
     overall_outputs = save_category_outputs(
         category_label="Overall",
         safe_label="overall",
         category_shap_values=overall_shap_values,
+        category_model_shap_values=overall_model_shap_values,
+        model_labels=model_labels,
         category_feature_df=sample_feature_df,
         raw_feature_names=raw_feature_names,
         display_feature_names=display_feature_names,
@@ -778,6 +992,15 @@ for grouping_name, group_labels in group_configs:
                 category_label=class_label,
                 safe_label=safe_label,
                 category_shap_values=shap_by_class[class_idx][class_mask],
+                category_model_shap_values=(
+                    [
+                        model_shap_by_class[class_idx][class_mask]
+                        for model_shap_by_class in shap_by_class_by_model
+                    ]
+                    if is_fold_model_mode
+                    else None
+                ),
+                model_labels=model_labels,
                 category_feature_df=sample_feature_df.iloc[class_mask],
                 raw_feature_names=raw_feature_names,
                 display_feature_names=display_feature_names,
@@ -792,12 +1015,21 @@ for grouping_name, group_labels in group_configs:
             continue
 
         class_shap_values = shap_by_class[class_idx][class_mask]
+        if is_fold_model_mode:
+            class_model_shap_values = [
+                model_shap_by_class[class_idx][class_mask]
+                for model_shap_by_class in shap_by_class_by_model
+            ]
+        else:
+            class_model_shap_values = None
         class_feature_df = sample_feature_df.iloc[class_mask]
 
         class_outputs = save_category_outputs(
             category_label=class_label,
             safe_label=safe_label,
             category_shap_values=class_shap_values,
+            category_model_shap_values=class_model_shap_values,
+            model_labels=model_labels,
             category_feature_df=class_feature_df,
             raw_feature_names=raw_feature_names,
             display_feature_names=display_feature_names,
@@ -852,8 +1084,9 @@ for grouping_name, group_labels in group_configs:
 
 print(f"Estimator: {estimator_name}")
 print(f"SHAP explainer: {explainer_name}")
+print(f"Explained models: {len(model_records)}")
 print(f"Explained rows: {len(X_sample)}")
-if X_transformed_background is not None:
-    print(f"Background rows: {X_transformed_background.shape[0]}")
+if background_rows is not None:
+    print(f"Background rows: {background_rows}")
     print(f"Background source: {background_source}")
 print(f"Saved explanation outputs to: {out_dir}")
