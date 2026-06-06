@@ -9,6 +9,7 @@ import argparse
 import os
 import subprocess
 
+import numpy as np
 import pandas as pd
 
 from sklearn.feature_selection import SelectKBest, f_classif
@@ -51,7 +52,24 @@ parser.add_argument("--univariate-cv", type=int, default=5)
 parser.add_argument("--univariate-threshold", type=float, default=None)
 parser.add_argument("--no-scale", dest="scale", action="store_false")
 parser.add_argument("--skip-correlated-selection", action="store_true")
-parser.set_defaults(scale=True)
+parser.add_argument(
+    "--bootstrap-train",
+    action="store_true",
+    help="Sample train rows with replacement before feature selection.",
+)
+parser.add_argument(
+    "--bootstrap-seed",
+    type=int,
+    default=123,
+    help="Random seed used when --bootstrap-train is set.",
+)
+parser.add_argument(
+    "--no-stratified-bootstrap",
+    dest="stratified_bootstrap",
+    action="store_false",
+    help="Disable class-stratified bootstrap resampling.",
+)
+parser.set_defaults(scale=True, stratified_bootstrap=True)
 args = parser.parse_args()
 
 
@@ -76,6 +94,21 @@ def assert_valid_input(train_df, test_df, target_column):
         "Feature selection expects numeric features. "
         f"Non-numeric columns found: {non_numeric.tolist()}"
     )
+
+
+def bootstrap_train_df(train_df, target_column, seed, stratified):
+    rng = np.random.default_rng(seed)
+
+    if not stratified:
+        sampled_positions = rng.choice(len(train_df), size=len(train_df), replace=True)
+        return train_df.iloc[sampled_positions].copy()
+
+    sampled_parts = []
+    for _, group in train_df.groupby(target_column, sort=False):
+        sampled_positions = rng.choice(len(group), size=len(group), replace=True)
+        sampled_parts.append(group.iloc[sampled_positions])
+
+    return pd.concat(sampled_parts, axis=0).sample(frac=1, random_state=seed).copy()
 
 
 def scale_for_selection(X_train):
@@ -152,6 +185,173 @@ def make_correlated_feature_sets_df(selector, selected_features):
     )
 
 
+def run_feature_selection(X_train, y_train, args):
+    summary_rows = [
+        {
+            "step": "input",
+            "n_features_before": X_train.shape[1],
+            "n_features_after": X_train.shape[1],
+            "n_dropped": 0,
+        }
+    ]
+    dropped_rows = []
+
+    if args.scale:
+        X_train_selection = scale_for_selection(X_train)
+    else:
+        X_train_selection = X_train.copy()
+
+    X_train_selection, constant_selector = fit_transform_train_selector(
+        DropConstantFeatures(missing_values="raise"),
+        X_train_selection,
+        "drop_constant",
+        summary_rows,
+        dropped_rows,
+    )
+
+    X_train_selection, duplicate_selector = fit_transform_train_selector(
+        DropDuplicateFeatures(missing_values="raise"),
+        X_train_selection,
+        "drop_duplicate",
+        summary_rows,
+        dropped_rows,
+    )
+
+    univariate_feature_performance = pd.DataFrame(
+        columns=["feature", "score", "pvalue", "score_std", "selected", "method"]
+    )
+    if not args.skip_univariate_selection:
+        if args.univariate_method == "select_k_best":
+            n_features_before = X_train_selection.shape[1]
+            univariate_selector = SelectKBest(score_func=f_classif, k="all")
+            univariate_selector.fit(X_train_selection, y_train)
+
+            scores = pd.Series(
+                univariate_selector.scores_,
+                index=X_train_selection.columns,
+                name="score",
+            )
+            pvalues = pd.Series(
+                univariate_selector.pvalues_,
+                index=X_train_selection.columns,
+                name="pvalue",
+            )
+            selected_features_univariate = pvalues[
+                pvalues < args.univariate_pvalue_threshold
+            ].index.tolist()
+            if len(selected_features_univariate) == 0:
+                raise ValueError(
+                    "No features passed SelectKBest p-value threshold "
+                    f"{args.univariate_pvalue_threshold}"
+                )
+
+            features_to_drop = [
+                feature
+                for feature in X_train_selection.columns
+                if feature not in selected_features_univariate
+            ]
+            dropped_rows.extend(
+                {"feature": feature, "step": "select_k_best_pvalue"}
+                for feature in features_to_drop
+            )
+            X_train_selection = X_train_selection[selected_features_univariate]
+            n_features_after = X_train_selection.shape[1]
+            summary_rows.append(
+                {
+                    "step": "select_k_best_pvalue",
+                    "n_features_before": n_features_before,
+                    "n_features_after": n_features_after,
+                    "n_dropped": n_features_before - n_features_after,
+                }
+            )
+            univariate_feature_performance = pd.DataFrame(
+                {
+                    "feature": scores.index,
+                    "score": scores.values,
+                    "pvalue": pvalues.values,
+                    "score_std": pd.NA,
+                    "selected": scores.index.isin(selected_features_univariate),
+                    "method": "select_k_best",
+                }
+            )
+        else:
+            X_train_selection, univariate_selector = fit_transform_train_selector(
+                SelectBySingleFeaturePerformance(
+                    estimator=LogisticRegression(max_iter=1000, solver="liblinear"),
+                    scoring=args.univariate_scoring,
+                    cv=args.univariate_cv,
+                    threshold=args.univariate_threshold,
+                ),
+                X_train_selection,
+                "select_by_single_feature_performance",
+                summary_rows,
+                dropped_rows,
+                y_train=y_train,
+            )
+            univariate_selected_features = set(univariate_selector.variables_) - set(
+                univariate_selector.features_to_drop_
+            )
+            univariate_feature_performance = pd.DataFrame(
+                {
+                    "feature": list(univariate_selector.feature_performance_.keys()),
+                    "score": list(univariate_selector.feature_performance_.values()),
+                    "pvalue": pd.NA,
+                    "score_std": [
+                        univariate_selector.feature_performance_std_.get(feature)
+                        for feature in univariate_selector.feature_performance_.keys()
+                    ],
+                    "selected": [
+                        feature in univariate_selected_features
+                        for feature in univariate_selector.feature_performance_.keys()
+                    ],
+                    "method": "single_feature_performance",
+                }
+            )
+
+    correlated_selector = None
+    if not args.skip_correlated_selection:
+        X_train_selection, correlated_selector = fit_transform_train_selector(
+            SmartCorrelatedSelection(
+                variables=None,
+                method=args.correlation_method,
+                threshold=args.correlation_threshold,
+                missing_values="raise",
+                selection_method=args.smart_selection_method,
+                estimator=None,
+            ),
+            X_train_selection,
+            "smart_correlated_selection",
+            summary_rows,
+            dropped_rows,
+        )
+
+    selected_features = list(X_train_selection.columns)
+    if correlated_selector is None:
+        correlated_feature_sets = pd.DataFrame(
+            columns=[
+                "group_id",
+                "selected_feature",
+                "correlated_features",
+                "dropped_features",
+            ]
+        )
+    else:
+        correlated_feature_sets = make_correlated_feature_sets_df(
+            correlated_selector,
+            selected_features,
+        )
+
+    return {
+        "selected_features": selected_features,
+        "dropped_features": pd.DataFrame(dropped_rows, columns=["feature", "step"]),
+        "univariate_feature_performance": univariate_feature_performance[
+            ["feature", "score", "pvalue", "score_std", "selected", "method"]
+        ],
+        "correlated_feature_sets": correlated_feature_sets,
+        "feature_selection_summary": pd.DataFrame(summary_rows),
+    }
+
+
 # %% ----- MAIN -----
 
 os.makedirs(args.out_dir, exist_ok=True)
@@ -164,220 +364,60 @@ test_df = pd.read_csv(args.test_path, index_col=0)
 
 assert_valid_input(train_df, test_df, args.target_column)
 
-X_train = train_df.drop(columns=[args.target_column])
-y_train = train_df[args.target_column]
+if args.bootstrap_train:
+    train_df_selection = bootstrap_train_df(
+        train_df,
+        target_column=args.target_column,
+        seed=args.bootstrap_seed,
+        stratified=args.stratified_bootstrap,
+    )
+else:
+    train_df_selection = train_df.copy()
 
-X_test = test_df.drop(columns=[args.target_column])
-y_test = test_df[args.target_column]
+X_train = train_df_selection.drop(columns=[args.target_column])
+y_train = train_df_selection[args.target_column]
 
 
 # %% Select features on train only
 
-summary_rows = [
-    {
-        "step": "input",
-        "n_features_before": X_train.shape[1],
-        "n_features_after": X_train.shape[1],
-        "n_dropped": 0,
-    }
-]
-dropped_rows = []
-
-if args.scale:
-    X_train_selection = scale_for_selection(X_train)
-else:
-    X_train_selection = X_train.copy()
-
-X_train_selection, constant_selector = fit_transform_train_selector(
-    DropConstantFeatures(missing_values="raise"),
-    X_train_selection,
-    "drop_constant",
-    summary_rows,
-    dropped_rows,
-)
-
-X_train_selection, duplicate_selector = fit_transform_train_selector(
-    DropDuplicateFeatures(missing_values="raise"),
-    X_train_selection,
-    "drop_duplicate",
-    summary_rows,
-    dropped_rows,
-)
-
-univariate_selector = None
-univariate_feature_performance = pd.DataFrame(
-    columns=["feature", "score", "pvalue", "score_std", "selected", "method"]
-)
-if not args.skip_univariate_selection:
-    if args.univariate_method == "select_k_best":
-        n_features_before = X_train_selection.shape[1]
-        univariate_selector = SelectKBest(score_func=f_classif, k="all")
-        univariate_selector.fit(X_train_selection, y_train)
-
-        scores = pd.Series(
-            univariate_selector.scores_,
-            index=X_train_selection.columns,
-            name="score",
-        )
-        pvalues = pd.Series(
-            univariate_selector.pvalues_,
-            index=X_train_selection.columns,
-            name="pvalue",
-        )
-        selected_features_univariate = pvalues[
-            pvalues < args.univariate_pvalue_threshold
-        ].index.tolist()
-        if len(selected_features_univariate) == 0:
-            raise ValueError(
-                "No features passed SelectKBest p-value threshold "
-                f"{args.univariate_pvalue_threshold}"
-            )
-
-        features_to_drop = [
-            feature
-            for feature in X_train_selection.columns
-            if feature not in selected_features_univariate
-        ]
-        dropped_rows.extend(
-            {"feature": feature, "step": "select_k_best_pvalue"}
-            for feature in features_to_drop
-        )
-        X_train_selection = X_train_selection[selected_features_univariate]
-        n_features_after = X_train_selection.shape[1]
-        summary_rows.append(
-            {
-                "step": "select_k_best_pvalue",
-                "n_features_before": n_features_before,
-                "n_features_after": n_features_after,
-                "n_dropped": n_features_before - n_features_after,
-            }
-        )
-        univariate_feature_performance = pd.DataFrame(
-            {
-                "feature": scores.index,
-                "score": scores.values,
-                "pvalue": pvalues.values,
-                "score_std": pd.NA,
-                "selected": scores.index.isin(selected_features_univariate),
-                "method": "select_k_best",
-            }
-        )
-    else:
-        X_train_selection, univariate_selector = fit_transform_train_selector(
-            SelectBySingleFeaturePerformance(
-                estimator=LogisticRegression(max_iter=1000, solver="liblinear"),
-                scoring=args.univariate_scoring,
-                cv=args.univariate_cv,
-                threshold=args.univariate_threshold,
-            ),
-            X_train_selection,
-            "select_by_single_feature_performance",
-            summary_rows,
-            dropped_rows,
-            y_train=y_train,
-        )
-        univariate_selected_features = set(univariate_selector.variables_) - set(
-            univariate_selector.features_to_drop_
-        )
-        univariate_feature_performance = pd.DataFrame(
-            {
-                "feature": list(univariate_selector.feature_performance_.keys()),
-                "score": list(univariate_selector.feature_performance_.values()),
-                "pvalue": pd.NA,
-                "score_std": [
-                    univariate_selector.feature_performance_std_.get(feature)
-                    for feature in univariate_selector.feature_performance_.keys()
-                ],
-                "selected": [
-                    feature in univariate_selected_features
-                    for feature in univariate_selector.feature_performance_.keys()
-                ],
-                "method": "single_feature_performance",
-            }
-        )
-
-correlated_selector = None
-if not args.skip_correlated_selection:
-    X_train_selection, correlated_selector = fit_transform_train_selector(
-        SmartCorrelatedSelection(
-            variables=None,
-            method=args.correlation_method,
-            threshold=args.correlation_threshold,
-            missing_values="raise",
-            selection_method=args.smart_selection_method,
-            estimator=None,
-        ),
-        X_train_selection,
-        "smart_correlated_selection",
-        summary_rows,
-        dropped_rows,
-    )
-
-selected_features = list(X_train_selection.columns)
-
-
-# %% Save benchmark-compatible reduced train and test CSVs
-
-train_reduced = pd.concat([X_train[selected_features], y_train], axis=1)
-test_reduced = pd.concat([X_test[selected_features], y_test], axis=1)
-
-assert train_reduced.drop(columns=[args.target_column]).columns.equals(
-    test_reduced.drop(columns=[args.target_column]).columns
-), "Reduced train and test feature columns differ"
-assert train_reduced[args.target_column].equals(y_train), (
-    "Train target changed during feature selection"
-)
-assert test_reduced[args.target_column].equals(y_test), (
-    "Test target changed during feature selection"
-)
-
-train_reduced.to_csv(os.path.join(args.out_dir, "train.csv"))
-test_reduced.to_csv(os.path.join(args.out_dir, "test.csv"))
+selection_outputs = run_feature_selection(X_train, y_train, args)
 
 
 # %% Save feature selection metadata
 
-pd.DataFrame({"feature": selected_features}).to_csv(
+pd.DataFrame({"feature": selection_outputs["selected_features"]}).to_csv(
     os.path.join(args.out_dir, "selected_features.csv"),
     index=False,
 )
 
-pd.DataFrame(dropped_rows, columns=["feature", "step"]).to_csv(
+selection_outputs["dropped_features"].to_csv(
     os.path.join(args.out_dir, "dropped_features.csv"),
     index=False,
 )
 
-univariate_feature_performance = univariate_feature_performance[
-    ["feature", "score", "pvalue", "score_std", "selected", "method"]
-]
-univariate_feature_performance.to_csv(
+selection_outputs["univariate_feature_performance"].to_csv(
     os.path.join(args.out_dir, "univariate_feature_performance.csv"),
     index=False,
 )
 
-if correlated_selector is None:
-    correlated_feature_sets = pd.DataFrame(
-        columns=[
-            "group_id",
-            "selected_feature",
-            "correlated_features",
-            "dropped_features",
-        ]
-    )
-else:
-    correlated_feature_sets = make_correlated_feature_sets_df(
-        correlated_selector,
-        selected_features,
-    )
-correlated_feature_sets.to_csv(
+selection_outputs["correlated_feature_sets"].to_csv(
     os.path.join(args.out_dir, "correlated_feature_sets.csv"),
     index=False,
 )
 
-pd.DataFrame(summary_rows).to_csv(
+summary_df = selection_outputs["feature_selection_summary"].copy()
+summary_df.insert(0, "bootstrap_train", bool(args.bootstrap_train))
+summary_df.insert(
+    1,
+    "bootstrap_seed",
+    args.bootstrap_seed if args.bootstrap_train else pd.NA,
+)
+summary_df.insert(2, "stratified_bootstrap", bool(args.stratified_bootstrap))
+summary_df.to_csv(
     os.path.join(args.out_dir, "feature_selection_summary.csv"),
     index=False,
 )
 
-print(pd.DataFrame(summary_rows))
-print(f"Saved reduced train/test and metadata to {args.out_dir}")
+print(summary_df)
+print(f"Selected features: {len(selection_outputs['selected_features'])}")
+print(f"Saved feature-selection metadata to {args.out_dir}")
