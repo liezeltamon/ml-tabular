@@ -1,6 +1,8 @@
-# sbatch -J explain_model -p long --mem=100G --output=%x.log.out --error=%x.log.err --wrap="python explain_model.py --model-path final_model_calibrated.pkl --data-path ../data/test.csv --label-column label --out-dir ../results/explain_model/test_data --max-samples 1000000"
+# sbatch -J explain_model -p long --mem=100G --output=%x.log.out --error=%x.log.err --wrap="python explain_model.py --model-path final_model_calibrated.pkl --data-path ../data/test.csv --label-column label --out-dir ../results/explain_model/test_data --max-samples 1000000 --mean-abs-shap-threshold 0"
 
-# sbatch -J explain_model_lda_progb_vs_nonprogb_selectkbest_p005_top5 -p long --mem=100G --output=logs/%x.log.out --error=logs/%x.log.err --wrap="python explain_model.py --model-path results/tune_models/progb_vs_nonprogb_selectkbest_p005_top5/final_model_uncalibrated.pkl --data-path results/select_features/progb_vs_nonprogb_selectkbest_p005/test.csv --background-data-path results/select_features/progb_vs_nonprogb_selectkbest_p005/train.csv --label-column is_progb --out-dir results/explain_model/progb_vs_nonprogb_selectkbest_p005_top5/uncalibrated --max-samples 0 --max-background-samples 0"
+# sbatch -J explain_model_lda_progb_vs_nonprogb_selectkbest_p005_top5 -p long --mem=100G --output=logs/%x.log.out --error=logs/%x.log.err --wrap="python explain_model.py --model-path results/tune_models/progb_vs_nonprogb_selectkbest_p005_top5/final_model_uncalibrated.pkl --data-path results/select_features/progb_vs_nonprogb_selectkbest_p005/test.csv --background-data-path results/select_features/progb_vs_nonprogb_selectkbest_p005/train.csv --label-column is_progb --out-dir results/explain_model/progb_vs_nonprogb_selectkbest_p005_top5/uncalibrated --max-samples 0 --max-background-samples 0 --mean-abs-shap-threshold 0"
+
+# sbatch -J explain_model_xgb_progb_vs_nonprogb_selectkbest_p005_nocorr_smartcorr_c09_cvfolds -p long --mem=100G --output=logs/%x.log.out --error=logs/%x.log.err --wrap="python explain_model.py --model-dir /well/immune-rep/users/yfg436/git/ml-tabular/results/tune_models/progb_vs_nonprogb_selectkbest_p005_no_correlated_selection_smartcorrelation_c09/cv_fold_models/xgb/uncalibrated --data-path /well/immune-rep/users/yfg436/git/ml-tabular/results/select_features/progb_vs_nonprogb_selectkbest_p005_no_correlated_selection_smartcorrelation_c09/test.csv --background-data-path /well/immune-rep/users/yfg436/git/ml-tabular/results/select_features/progb_vs_nonprogb_selectkbest_p005_no_correlated_selection_smartcorrelation_c09/train.csv --label-column is_progb --out-dir results/explain_model/progb_vs_nonprogb_selectkbest_p005_no_correlated_selection_smartcorrelation_c09/xgb_cvfolds_uncalibrated --max-samples 0 --max-background-samples 0 --mean-abs-shap-threshold 0"
 
 import argparse
 import joblib
@@ -315,7 +317,7 @@ def save_bar_grid(plot_items, output_path):
     plt.close(fig)
 
 
-def save_beeswarm_grid(plot_items, output_path, top_features):
+def save_beeswarm_grid(plot_items, output_path):
     if not plot_items:
         return
 
@@ -326,7 +328,7 @@ def save_beeswarm_grid(plot_items, output_path, top_features):
     fig, axes = plt.subplots(
         n_rows,
         n_cols,
-        figsize=(5.8 * n_cols, 4.8 * n_rows),
+        figsize=(8.0 * n_cols, 4.8 * n_rows),
         squeeze=False,
     )
     flat_axes = axes.flatten()
@@ -335,12 +337,13 @@ def save_beeswarm_grid(plot_items, output_path, top_features):
         class_label = plot_item["class_label"]
         class_shap_values = plot_item["class_shap_values"]
         class_feature_df = plot_item["class_feature_df"]
+        max_display = plot_item["max_display"]
 
         plt.sca(ax)
         shap.summary_plot(
             class_shap_values,
             class_feature_df,
-            max_display=top_features,
+            max_display=max_display,
             show=False,
             color_bar=False,
             plot_size=None,
@@ -396,6 +399,50 @@ def save_dependence_grid(plot_items, output_path):
     plt.close(fig)
 
 
+def select_display_summary(summary_df, top_features, mean_abs_shap_threshold):
+    display_df = summary_df[
+        summary_df["mean_abs_shap"] > mean_abs_shap_threshold
+    ]
+    if top_features is not None:
+        display_df = display_df.head(top_features)
+    return display_df.copy()
+
+
+def save_mean_abs_shap_distribution(summary_df, output_path, mean_abs_shap_threshold):
+    values = summary_df["mean_abs_shap"].dropna().to_numpy()
+
+    fig, ax = plt.subplots(figsize=(8, 4.8))
+    if len(values) > 0:
+        bins = min(50, max(10, int(np.sqrt(len(values)))))
+        ax.hist(values, bins=bins, color="steelblue", alpha=0.85)
+    else:
+        ax.text(
+            0.5,
+            0.5,
+            "No features",
+            ha="center",
+            va="center",
+            transform=ax.transAxes,
+        )
+
+    if mean_abs_shap_threshold is not None:
+        ax.axvline(
+            mean_abs_shap_threshold,
+            color="crimson",
+            linestyle="--",
+            linewidth=1.5,
+            label=f"Threshold = {mean_abs_shap_threshold:g}",
+        )
+        ax.legend()
+
+    ax.set_xlabel("Mean |SHAP|")
+    ax.set_ylabel("Feature count")
+    ax.set_title("Mean |SHAP| distribution")
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+
 def save_category_outputs(
     category_label,
     safe_label,
@@ -407,10 +454,12 @@ def save_category_outputs(
     display_feature_names,
     top_features,
     heatmap_top_features,
+    mean_abs_shap_threshold,
     tables_dir,
     bars_dir,
     beeswarms_dir,
     dependence_dir,
+    mean_abs_shap_distributions_dir,
 ):
     fold_mode = category_model_shap_values is not None and len(model_labels) > 1
     base_columns = [
@@ -455,6 +504,7 @@ def save_category_outputs(
 
     summary_df = pd.DataFrame(
         {
+            "feature_index": np.arange(len(raw_feature_names)),
             "raw_feature": raw_feature_names,
             "display_feature": display_feature_names,
             "mean_abs_shap": mean_abs_shap,
@@ -476,12 +526,43 @@ def save_category_outputs(
         ascending=False,
     ).reset_index(drop=True)
 
-    summary_df.to_csv(
+    summary_df.drop(columns=["feature_index"]).to_csv(
         tables_dir / f"{safe_label}__top_features.csv",
         index=False,
     )
 
-    plot_df = summary_df.head(top_features).iloc[::-1]
+    save_mean_abs_shap_distribution(
+        summary_df,
+        mean_abs_shap_distributions_dir
+        / f"{safe_label}__mean_abs_shap_distribution.png",
+        mean_abs_shap_threshold,
+    )
+    save_mean_abs_shap_distribution(
+        summary_df[summary_df["mean_abs_shap"] > 0],
+        mean_abs_shap_distributions_dir
+        / f"{safe_label}__mean_abs_shap_distribution_nonzero.png",
+        mean_abs_shap_threshold,
+    )
+
+    display_summary_df = select_display_summary(
+        summary_df,
+        top_features,
+        mean_abs_shap_threshold,
+    )
+    if display_summary_df.empty:
+        return {
+            "heatmap_features": [],
+            "heatmap_row": pd.Series(dtype=float, name=str(category_label)),
+            "bar_grid_item": None,
+            "beeswarm_grid_item": None,
+        }
+
+    selected_feature_indices = display_summary_df["feature_index"].to_numpy()
+    selected_feature_names = display_summary_df["display_feature"].to_numpy()
+    selected_shap_values = category_shap_values[:, selected_feature_indices]
+    selected_feature_df = category_feature_df.loc[:, selected_feature_names]
+
+    plot_df = display_summary_df.iloc[::-1]
     bar_grid_item = {
         "class_label": category_label,
         "plot_df": plot_df,
@@ -499,12 +580,13 @@ def save_category_outputs(
     fig.savefig(bars_dir / f"{safe_label}__bar.png", dpi=300)
     plt.close(fig)
 
-    plt.figure(figsize=(8, max(4, 0.55 * top_features + 1)))
+    plt.figure(figsize=(14, max(4, 0.55 * len(display_summary_df) + 1)))
     shap.summary_plot(
-        category_shap_values,
-        category_feature_df,
-        max_display=top_features,
+        selected_shap_values,
+        selected_feature_df,
+        max_display=len(display_summary_df),
         show=False,
+        plot_size=None,
     )
     plt.title(f"{category_label}: SHAP distribution")
     plt.tight_layout()
@@ -517,13 +599,12 @@ def save_category_outputs(
 
     beeswarm_grid_item = {
         "class_label": category_label,
-        "class_shap_values": category_shap_values,
-        "class_feature_df": category_feature_df,
+        "class_shap_values": selected_shap_values,
+        "class_feature_df": selected_feature_df,
+        "max_display": len(display_summary_df),
     }
 
-    dependence_feature_names = summary_df.head(top_features)[
-        "display_feature"
-    ].tolist()
+    dependence_feature_names = display_summary_df["display_feature"].tolist()
     dependence_grid_items = []
 
     for feature_name in dependence_feature_names:
@@ -532,16 +613,16 @@ def save_category_outputs(
         dependence_grid_items.append(
             {
                 "feature_name": feature_name,
-                "class_shap_values": category_shap_values,
-                "class_feature_df": category_feature_df,
+                "class_shap_values": selected_shap_values,
+                "class_feature_df": selected_feature_df,
             }
         )
 
         fig, ax = plt.subplots(figsize=(6.2, 4.8))
         shap.dependence_plot(
             feature_name,
-            category_shap_values,
-            category_feature_df,
+            selected_shap_values,
+            selected_feature_df,
             interaction_index="auto",
             ax=ax,
             show=False,
@@ -563,7 +644,9 @@ def save_category_outputs(
         dependence_dir / f"{safe_label}__dependence_grid.png",
     )
 
-    heatmap_top_df = summary_df.head(heatmap_top_features)
+    heatmap_top_df = display_summary_df
+    if heatmap_top_features is not None:
+        heatmap_top_df = heatmap_top_df.head(heatmap_top_features)
     return {
         "heatmap_features": heatmap_top_df["raw_feature"].tolist(),
         "heatmap_row": heatmap_top_df.set_index("raw_feature")[
@@ -620,14 +703,29 @@ parser.add_argument(
 parser.add_argument(
     "--top-features",
     type=int,
-    default=5,
-    help="Number of top features to show in class-level plots.",
+    default=None,
+    help=(
+        "Optional maximum number of features to show in class-level plots. "
+        "By default, all features above --mean-abs-shap-threshold are shown."
+    ),
 )
 parser.add_argument(
     "--heatmap-top-features-per-class",
     type=int,
-    default=10,
-    help="Number of top features per class used to build the heatmap union.",
+    default=None,
+    help=(
+        "Optional maximum number of features per class used to build the heatmap union. "
+        "By default, all displayed features contribute."
+    ),
+)
+parser.add_argument(
+    "--mean-abs-shap-threshold",
+    type=float,
+    default=0.0,
+    help=(
+        "Minimum mean absolute SHAP value for displayed features. "
+        "Features must be strictly greater than this threshold."
+    ),
 )
 parser.add_argument(
     "--max-samples",
@@ -651,6 +749,16 @@ parser.add_argument(
     help="Random seed for reproducible sampling.",
 )
 args = parser.parse_args()
+
+if args.mean_abs_shap_threshold is not None and args.mean_abs_shap_threshold < 0:
+    raise ValueError("--mean-abs-shap-threshold must be >= 0.")
+if args.top_features is not None and args.top_features <= 0:
+    raise ValueError("--top-features must be > 0 when provided.")
+if (
+    args.heatmap_top_features_per_class is not None
+    and args.heatmap_top_features_per_class <= 0
+):
+    raise ValueError("--heatmap-top-features-per-class must be > 0 when provided.")
 
 # %% Path resolution and validation
 
@@ -923,11 +1031,13 @@ for grouping_name, group_labels in group_configs:
     bars_dir = group_dir / "bars"
     beeswarms_dir = group_dir / "beeswarms"
     dependence_dir = group_dir / "dependence"
+    mean_abs_shap_distributions_dir = group_dir / "mean_abs_shap_distributions"
 
     tables_dir.mkdir(parents=True, exist_ok=True)
     bars_dir.mkdir(parents=True, exist_ok=True)
     beeswarms_dir.mkdir(parents=True, exist_ok=True)
     dependence_dir.mkdir(parents=True, exist_ok=True)
+    mean_abs_shap_distributions_dir.mkdir(parents=True, exist_ok=True)
 
     class_counts = pd.Series(group_labels).value_counts().reindex(
         class_labels,
@@ -971,10 +1081,12 @@ for grouping_name, group_labels in group_configs:
         display_feature_names=display_feature_names,
         top_features=args.top_features,
         heatmap_top_features=args.heatmap_top_features_per_class,
+        mean_abs_shap_threshold=args.mean_abs_shap_threshold,
         tables_dir=tables_dir,
         bars_dir=bars_dir,
         beeswarms_dir=beeswarms_dir,
         dependence_dir=dependence_dir,
+        mean_abs_shap_distributions_dir=mean_abs_shap_distributions_dir,
     )
     heatmap_feature_union.extend(overall_outputs["heatmap_features"])
     heatmap_rows.append(overall_outputs["heatmap_row"])
@@ -1006,10 +1118,12 @@ for grouping_name, group_labels in group_configs:
                 display_feature_names=display_feature_names,
                 top_features=args.top_features,
                 heatmap_top_features=args.heatmap_top_features_per_class,
+                mean_abs_shap_threshold=args.mean_abs_shap_threshold,
                 tables_dir=tables_dir,
                 bars_dir=bars_dir,
                 beeswarms_dir=beeswarms_dir,
                 dependence_dir=dependence_dir,
+                mean_abs_shap_distributions_dir=mean_abs_shap_distributions_dir,
             )
             heatmap_rows.append(empty_outputs["heatmap_row"])
             continue
@@ -1035,10 +1149,12 @@ for grouping_name, group_labels in group_configs:
             display_feature_names=display_feature_names,
             top_features=args.top_features,
             heatmap_top_features=args.heatmap_top_features_per_class,
+            mean_abs_shap_threshold=args.mean_abs_shap_threshold,
             tables_dir=tables_dir,
             bars_dir=bars_dir,
             beeswarms_dir=beeswarms_dir,
             dependence_dir=dependence_dir,
+            mean_abs_shap_distributions_dir=mean_abs_shap_distributions_dir,
         )
         heatmap_feature_union.extend(class_outputs["heatmap_features"])
         heatmap_rows.append(class_outputs["heatmap_row"])
@@ -1070,7 +1186,6 @@ for grouping_name, group_labels in group_configs:
     save_beeswarm_grid(
         beeswarm_grid_items,
         group_dir / "all_classes__beeswarm_grid.png",
-        args.top_features,
     )
 
     if heatmap_display_df.shape[1] > 0:
