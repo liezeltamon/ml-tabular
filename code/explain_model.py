@@ -2,7 +2,9 @@
 
 # sbatch -J explain_model_lda_progb_vs_nonprogb_selectkbest_p005_top5 -p long --mem=100G --output=logs/%x.log.out --error=logs/%x.log.err --wrap="python explain_model.py --model-path results/tune_models/progb_vs_nonprogb_selectkbest_p005_top5/final_model_uncalibrated.pkl --data-path results/select_features/progb_vs_nonprogb_selectkbest_p005/test.csv --background-data-path results/select_features/progb_vs_nonprogb_selectkbest_p005/train.csv --label-column is_progb --out-dir results/explain_model/progb_vs_nonprogb_selectkbest_p005_top5/uncalibrated --max-samples 0 --max-background-samples 0 --mean-abs-shap-threshold 0"
 
-# sbatch -J explain_model_xgb_progb_vs_nonprogb_selectkbest_p005_nocorr_smartcorr_c09_cvfolds -p long --mem=100G --output=logs/%x.log.out --error=logs/%x.log.err --wrap="python explain_model.py --model-dir /well/immune-rep/users/yfg436/git/ml-tabular/results/tune_models/progb_vs_nonprogb_selectkbest_p005_no_correlated_selection_smartcorrelation_c09/cv_fold_models/xgb/uncalibrated --data-path /well/immune-rep/users/yfg436/git/ml-tabular/results/select_features/progb_vs_nonprogb_selectkbest_p005_no_correlated_selection_smartcorrelation_c09/test.csv --background-data-path /well/immune-rep/users/yfg436/git/ml-tabular/results/select_features/progb_vs_nonprogb_selectkbest_p005_no_correlated_selection_smartcorrelation_c09/train.csv --label-column is_progb --out-dir results/explain_model/progb_vs_nonprogb_selectkbest_p005_no_correlated_selection_smartcorrelation_c09/xgb_cvfolds_uncalibrated --max-samples 0 --max-background-samples 0 --mean-abs-shap-threshold 0"
+# sbatch -J explain_model_xgb_progb_vs_nonprogb_selectkbest_p005_nocorr_smartcorr_c09_cvfolds -p long --mem=50G --output=logs/%x.log.out --error=logs/%x.log.err --wrap="python explain_model.py --model-dir /well/immune-rep/users/yfg436/git/ml-tabular/results/tune_models/progb_vs_nonprogb_selectkbest_p005_no_correlated_selection_smartcorrelation_c09/cv_fold_models/xgb/uncalibrated --data-path /well/immune-rep/users/yfg436/git/ml-tabular/results/select_features/progb_vs_nonprogb_selectkbest_p005_no_correlated_selection_smartcorrelation_c09/test.csv /well/immune-rep/users/yfg436/git/ml-tabular/results/select_features/progb_vs_nonprogb_selectkbest_p005_no_correlated_selection_smartcorrelation_c09/train.csv --background-data-path /well/immune-rep/users/yfg436/git/ml-tabular/results/select_features/progb_vs_nonprogb_selectkbest_p005_no_correlated_selection_smartcorrelation_c09/train.csv --label-column is_progb --out-dir results/explain_model/progb_vs_nonprogb_selectkbest_p005_no_correlated_selection_smartcorrelation_c09/xgb_cvfolds_uncalibrated --max-samples 0 --max-background-samples 0.9 --mean-abs-shap-threshold 0"
+
+# sbatch -J explain_model_lda_progb_vs_nonprogb_selectkbest_p005_nocorr_summary_cvfolds -p long --mem=50G --output=logs/%x.log.out --error=logs/%x.log.err --wrap="python explain_model.py --model-dir /well/immune-rep/users/yfg436/git/ml-tabular/results/tune_models/progb_vs_nonprogb_selectkbest_p005_no_correlated_selection/cv_fold_models/lda/uncalibrated --data-path /well/immune-rep/users/yfg436/git/ml-tabular/results/summarise_bootstrap_features/progb_vs_nonprogb_selectkbest_p005_no_correlated_selection/test.csv /well/immune-rep/users/yfg436/git/ml-tabular/results/summarise_bootstrap_features/progb_vs_nonprogb_selectkbest_p005_no_correlated_selection/train.csv --background-data-path /well/immune-rep/users/yfg436/git/ml-tabular/results/summarise_bootstrap_features/progb_vs_nonprogb_selectkbest_p005_no_correlated_selection/train.csv --label-column is_progb --out-dir results/explain_model/progb_vs_nonprogb_selectkbest_p005_no_correlated_selection/lda_cvfolds_uncalibrated --max-samples 0 --max-background-samples 0.9 --mean-abs-shap-threshold 0"
 
 import argparse
 import joblib
@@ -38,36 +40,35 @@ SUPPORTED_ESTIMATOR_NAMES = {
     "LinearDiscriminantAnalysis",
 }
 
-TREE_EXPLAINER_ESTIMATOR_NAMES = {
-    "LGBMClassifier",
-    "RandomForestClassifier",
-    "ExtraTreesClassifier",
-    "CatBoostClassifier",
-    "XGBClassifier",
-}
+def reshape_shap_values_container(shap_values, class_labels):
+    class_labels = np.asarray(class_labels)
+    n_classes = len(class_labels)
 
-LINEAR_EXPLAINER_ESTIMATOR_NAMES = {
-    "LinearDiscriminantAnalysis",
-}
-
-
-def normalize_shap_values(shap_values, n_classes):
     if isinstance(shap_values, list):
-        normalized = [np.asarray(values) for values in shap_values]
+        shap_by_output = [np.asarray(values) for values in shap_values]
+        shap_output_labels = class_labels
     else:
         values = np.asarray(getattr(shap_values, "values", shap_values))
 
         if values.ndim == 2:
             if n_classes != 2:
                 raise ValueError(
-                    "Received 2D SHAP values for a model with more than two classes."
+                    "Received 2D SHAP values for a model with more than two classes; "
+                    "there is no class/output axis to reshape safely."
                 )
-            normalized = [-values, values]
+            shap_by_output = [values]
+            shap_output_labels = np.asarray([class_labels[-1]])
         elif values.ndim == 3:
             if values.shape[1] == n_classes:
-                normalized = [values[:, class_idx, :] for class_idx in range(n_classes)]
+                shap_by_output = [
+                    values[:, class_idx, :] for class_idx in range(n_classes)
+                ]
+                shap_output_labels = class_labels
             elif values.shape[2] == n_classes:
-                normalized = [values[:, :, class_idx] for class_idx in range(n_classes)]
+                shap_by_output = [
+                    values[:, :, class_idx] for class_idx in range(n_classes)
+                ]
+                shap_output_labels = class_labels
             else:
                 raise ValueError(
                     f"Could not align SHAP values with {n_classes} classes. Received shape {values.shape}."
@@ -75,33 +76,58 @@ def normalize_shap_values(shap_values, n_classes):
         else:
             raise ValueError(f"Unsupported SHAP value shape: {values.shape}")
 
-    if len(normalized) != n_classes:
+    if len(shap_by_output) != len(shap_output_labels):
         raise ValueError(
-            f"Expected SHAP outputs for {n_classes} classes, received {len(normalized)}."
+            "Number of SHAP output matrices does not match number of output labels."
         )
 
-    return [np.asarray(class_values) for class_values in normalized]
+    if len(shap_by_output) not in {1, n_classes}:
+        raise ValueError(
+            f"Expected 1 or {n_classes} SHAP outputs, received {len(shap_by_output)}."
+        )
+
+    return [np.asarray(values) for values in shap_by_output], shap_output_labels
 
 
-def select_row_aligned_shap_values(shap_by_class, class_labels, row_labels):
-    class_to_idx = {class_label: idx for idx, class_label in enumerate(class_labels)}
-    row_labels = np.asarray(row_labels)
+def get_output_shap_values(shap_by_output, shap_output_labels, output_label):
+    output_matches = np.where(np.asarray(shap_output_labels) == output_label)[0]
+    if len(output_matches) == 0:
+        available = ", ".join(map(str, shap_output_labels))
+        raise ValueError(
+            f"Could not find SHAP output for label {output_label!r}. "
+            f"Available SHAP outputs: {available}"
+        )
+    return shap_by_output[output_matches[0]]
 
-    missing_labels = pd.Index(row_labels).difference(pd.Index(class_labels))
-    if len(missing_labels) > 0:
-        missing = ", ".join(map(str, missing_labels))
-        raise ValueError(f"Could not find SHAP values for labels: {missing}")
 
-    n_rows = len(row_labels)
-    n_features = shap_by_class[0].shape[1]
-    row_shap_values = np.empty((n_rows, n_features))
+def build_row_matched_shap_values(shap_by_output, shap_output_labels, group_labels):
+    shap_output_labels = np.asarray(shap_output_labels)
+    group_labels = np.asarray(group_labels)
+    shap_by_output = [np.asarray(values) for values in shap_by_output]
 
-    for class_label, class_idx in class_to_idx.items():
-        class_mask = row_labels == class_label
-        if np.any(class_mask):
-            row_shap_values[class_mask] = shap_by_class[class_idx][class_mask]
+    if not shap_by_output:
+        raise ValueError("Cannot build row-matched SHAP values without SHAP outputs.")
 
-    return row_shap_values
+    n_features = shap_by_output[0].shape[1]
+    matched_values = []
+    matched_row_indices = []
+
+    for row_idx, group_label in enumerate(group_labels):
+        output_matches = np.where(shap_output_labels == group_label)[0]
+        if len(output_matches) == 0:
+            continue
+
+        output_values = shap_by_output[output_matches[0]]
+        matched_values.append(output_values[row_idx])
+        matched_row_indices.append(row_idx)
+
+    if not matched_values:
+        return (
+            np.empty((0, n_features), dtype=shap_by_output[0].dtype),
+            np.asarray([], dtype=int),
+        )
+
+    return np.vstack(matched_values), np.asarray(matched_row_indices, dtype=int)
 
 
 def sanitize_label(value):
@@ -118,9 +144,19 @@ def to_dense_array(values):
     return np.asarray(values)
 
 
+def resolve_sample_size(n_rows, max_samples):
+    if max_samples is None or max_samples <= 0:
+        return n_rows
+    if 0 < max_samples < 1:
+        return max(1, int(np.ceil(n_rows * max_samples)))
+    return int(np.ceil(max_samples))
+
+
 def select_sample_indices(row_labels, max_samples, random_state):
     all_indices = np.arange(len(row_labels))
-    if max_samples is None or max_samples <= 0 or len(row_labels) <= max_samples:
+    sample_size = resolve_sample_size(len(row_labels), max_samples)
+
+    if len(row_labels) <= sample_size:
         return all_indices
 
     unique_classes, class_counts = np.unique(row_labels, return_counts=True)
@@ -130,7 +166,7 @@ def select_sample_indices(row_labels, max_samples, random_state):
         try:
             sample_indices, _ = train_test_split(
                 all_indices,
-                train_size=max_samples,
+                train_size=sample_size,
                 random_state=random_state,
                 stratify=row_labels,
             )
@@ -139,13 +175,15 @@ def select_sample_indices(row_labels, max_samples, random_state):
             pass
 
     rng = np.random.default_rng(random_state)
-    return np.sort(rng.choice(all_indices, size=max_samples, replace=False))
+    return np.sort(rng.choice(all_indices, size=sample_size, replace=False))
 
 
 def load_background_data(background_data_path, label_column, reference_columns):
     background_df = pd.read_csv(background_data_path, index_col=0)
+    background_labels = None
 
     if label_column in background_df.columns:
+        background_labels = background_df[label_column].copy()
         background_df = background_df.drop(columns=[label_column])
 
     if list(background_df.columns) != list(reference_columns):
@@ -153,20 +191,52 @@ def load_background_data(background_data_path, label_column, reference_columns):
             "Background feature columns must exactly match explanation data columns."
         )
 
-    return background_df
+    return background_df, background_labels
 
 
-def build_explainer(estimator, estimator_name, X_transformed_background):
-    if estimator_name in TREE_EXPLAINER_ESTIMATOR_NAMES:
-        return shap.TreeExplainer(estimator), "TreeExplainer"
+def load_explanation_data(data_paths, label_column):
+    loaded_dfs = []
+    data_sources = []
+    reference_feature_columns = None
 
-    if estimator_name in LINEAR_EXPLAINER_ESTIMATOR_NAMES:
-        return (
-            shap.LinearExplainer(estimator, X_transformed_background),
-            "LinearExplainer",
-        )
+    for data_path in data_paths:
+        data_df = pd.read_csv(data_path, index_col=0)
 
-    raise ValueError(f"Unsupported estimator '{estimator_name}'.")
+        if label_column not in data_df.columns:
+            raise ValueError(
+                f"Label column '{label_column}' not found in {data_path}."
+            )
+
+        feature_columns = data_df.drop(columns=[label_column]).columns.tolist()
+        if reference_feature_columns is None:
+            reference_feature_columns = feature_columns
+        elif feature_columns != reference_feature_columns:
+            raise ValueError(
+                "All explanation data files must have identical ordered feature "
+                f"columns. Mismatch found in {data_path}."
+            )
+
+        loaded_dfs.append(data_df)
+        data_sources.extend([sanitize_label(data_path.stem)] * data_df.shape[0])
+
+    combined_df = pd.concat(loaded_dfs, axis=0)
+    return combined_df, pd.Series(data_sources, index=combined_df.index)
+
+
+def build_explainer(
+    estimator,
+    X_transformed_background,
+    class_labels,
+    display_feature_names,
+):
+    explainer = shap.Explainer(
+        estimator,
+        X_transformed_background,
+        algorithm="auto",
+        output_names=class_labels,
+        feature_names=display_feature_names,
+    )
+    return explainer, explainer.__class__.__name__
 
 
 def load_model_paths(model_path, model_dir, model_glob):
@@ -290,7 +360,7 @@ def save_bar_grid(plot_items, output_path):
     fig, axes = plt.subplots(
         n_rows,
         n_cols,
-        figsize=(4.8 * n_cols, 3.6 * n_rows),
+        figsize=(4.8 * n_cols, 5.8 * n_rows),
         squeeze=False,
     )
     flat_axes = axes.flatten()
@@ -328,7 +398,7 @@ def save_beeswarm_grid(plot_items, output_path):
     fig, axes = plt.subplots(
         n_rows,
         n_cols,
-        figsize=(8.0 * n_cols, 4.8 * n_rows),
+        figsize=(8.0 * n_cols, 7.2 * n_rows),
         squeeze=False,
     )
     flat_axes = axes.flatten()
@@ -361,6 +431,26 @@ def save_beeswarm_grid(plot_items, output_path):
     plt.close(fig)
 
 
+def style_dependence_plot(fig, ax, title, fontsize=5):
+    ax.set_title(title, fontsize=fontsize)
+    ax.tick_params(axis="both", labelsize=fontsize)
+    ax.set_xlabel(ax.get_xlabel(), fontsize=fontsize)
+    ax.set_ylabel(ax.get_ylabel(), fontsize=fontsize)
+
+    for plot_ax in fig.axes:
+        legend = plot_ax.get_legend()
+        if legend is not None:
+            legend.get_title().set_fontsize(fontsize)
+            for text in legend.get_texts():
+                text.set_fontsize(fontsize)
+
+        if plot_ax is not ax:
+            plot_ax.set_title(plot_ax.get_title(), fontsize=fontsize)
+            plot_ax.set_xlabel(plot_ax.get_xlabel(), fontsize=fontsize)
+            plot_ax.set_ylabel(plot_ax.get_ylabel(), fontsize=fontsize)
+            plot_ax.tick_params(axis="both", labelsize=fontsize)
+
+
 def save_dependence_grid(plot_items, output_path):
     if not plot_items:
         return
@@ -386,10 +476,7 @@ def save_dependence_grid(plot_items, output_path):
             ax=ax,
             show=False,
         )
-        ax.set_title(str(plot_item["feature_name"]), fontsize=10)
-        ax.tick_params(axis="both", labelsize=7)
-        ax.set_xlabel(ax.get_xlabel(), fontsize=8)
-        ax.set_ylabel(ax.get_ylabel(), fontsize=8)
+        style_dependence_plot(fig, ax, str(plot_item["feature_name"]))
 
     for ax in flat_axes[n_panels:]:
         ax.set_visible(False)
@@ -580,7 +667,7 @@ def save_category_outputs(
     fig.savefig(bars_dir / f"{safe_label}__bar.png", dpi=300)
     plt.close(fig)
 
-    plt.figure(figsize=(14, max(4, 0.55 * len(display_summary_df) + 1)))
+    plt.figure(figsize=(20, max(4, 0.55 * len(display_summary_df) + 1)))
     shap.summary_plot(
         selected_shap_values,
         selected_feature_df,
@@ -627,10 +714,7 @@ def save_category_outputs(
             ax=ax,
             show=False,
         )
-        ax.set_title(f"{category_label}: {feature_name}", fontsize=10)
-        ax.tick_params(axis="both", labelsize=8)
-        ax.set_xlabel(ax.get_xlabel(), fontsize=9)
-        ax.set_ylabel(ax.get_ylabel(), fontsize=9)
+        style_dependence_plot(fig, ax, f"{category_label}: {feature_name}")
         fig.tight_layout()
         fig.savefig(
             dependence_dir / f"{safe_label}__dependence__{safe_feature}.png",
@@ -679,15 +763,20 @@ parser.add_argument(
 )
 parser.add_argument(
     "--data-path",
-    default=str(script_dir.parent / "data" / "test.csv"),
-    help="Path to the labeled CSV used for explanation.",
+    nargs="+",
+    default=[str(script_dir.parent / "data" / "test.csv")],
+    help=(
+        "One or more labeled CSVs used for explanation. Multiple files are "
+        "row-bound."
+    ),
 )
 parser.add_argument(
     "--background-data-path",
     default=None,
     help=(
-        "Optional CSV used as SHAP background/reference data for linear "
-        "explainers. If it contains the label column, that column is dropped."
+        "Optional CSV used as SHAP background/reference data. If it contains "
+        "the label column, that column is dropped after optional stratified "
+        "background sampling."
     ),
 )
 parser.add_argument(
@@ -729,17 +818,22 @@ parser.add_argument(
 )
 parser.add_argument(
     "--max-samples",
-    type=int,
+    type=float,
     default=2000,
-    help="Maximum number of rows used for SHAP computation.",
+    help=(
+        "Rows used for SHAP computation. Values <= 0 use all rows; values "
+        "between 0 and 1 sample that fraction; values >= 1 sample up to that "
+        "many rows."
+    ),
 )
 parser.add_argument(
     "--max-background-samples",
-    type=int,
+    type=float,
     default=0,
     help=(
-        "Maximum number of background rows used for linear SHAP. "
-        "Values <= 0 use all background rows."
+        "Rows used for SHAP background. Values <= 0 use all background rows; "
+        "values between 0 and 1 sample that fraction; values >= 1 sample up "
+        "to that many rows."
     ),
 )
 parser.add_argument(
@@ -763,7 +857,7 @@ if (
 # %% Path resolution and validation
 
 model_paths = load_model_paths(args.model_path, args.model_dir, args.model_glob)
-data_path = Path(args.data_path).resolve()
+data_paths = [Path(data_path).resolve() for data_path in args.data_path]
 background_data_path = (
     Path(args.background_data_path).resolve()
     if args.background_data_path is not None
@@ -780,8 +874,9 @@ else:
 for model_path in model_paths:
     if not model_path.exists():
         raise FileNotFoundError(f"Model file not found: {model_path}")
-if not data_path.exists():
-    raise FileNotFoundError(f"Data file not found: {data_path}")
+for data_path in data_paths:
+    if not data_path.exists():
+        raise FileNotFoundError(f"Data file not found: {data_path}")
 if background_data_path is not None and not background_data_path.exists():
     raise FileNotFoundError(f"Background data file not found: {background_data_path}")
 
@@ -827,12 +922,7 @@ for model_record in model_records[1:]:
 
 # %% Dataset loading
 
-data_df = pd.read_csv(data_path, index_col=0)
-
-if args.label_column not in data_df.columns:
-    raise ValueError(
-        f"Label column '{args.label_column}' not found in {data_path}."
-    )
+data_df, data_source = load_explanation_data(data_paths, args.label_column)
 
 X = data_df.drop(columns=[args.label_column])
 y_true = data_df[args.label_column]
@@ -865,28 +955,34 @@ y_pred_sample = (
 
 # %% Preprocessing and SHAP computation
 
-if estimator_name in LINEAR_EXPLAINER_ESTIMATOR_NAMES and background_data_path is not None:
-    X_background = load_background_data(
+if background_data_path is not None:
+    X_background, background_labels = load_background_data(
         background_data_path,
         label_column=args.label_column,
         reference_columns=X.columns,
     )
     background_indices = select_sample_indices(
-        np.zeros(len(X_background)),
+        (
+            background_labels.to_numpy()
+            if background_labels is not None
+            else np.zeros(len(X_background))
+        ),
         max_samples=args.max_background_samples,
         random_state=args.random_state,
     )
     X_background = X_background.iloc[background_indices].copy()
+    background_source = str(background_data_path)
 else:
     X_background = None
+    background_labels = None
 
 X_transformed_sample_by_model = []
-shap_by_class_by_model = []
+shap_by_output_by_model = []
 explainer_names = []
 raw_feature_names = None
 display_feature_names = None
-background_source = None
 background_rows = None
+shap_output_labels = None
 
 for model_record in model_records:
     feature_transformer = model_record["feature_transformer"]
@@ -918,18 +1014,14 @@ for model_record in model_records:
                 "the first model."
             )
 
-    if estimator_name in LINEAR_EXPLAINER_ESTIMATOR_NAMES:
-        if X_background is None:
-            X_transformed_background = X_transformed_sample_model
-            background_source = "sampled explanation data"
-        else:
-            X_transformed_background = to_dense_array(
-                feature_transformer.transform(X_background)
-            )
-            background_source = str(background_data_path)
-        background_rows = X_transformed_background.shape[0]
+    if X_background is None:
+        X_transformed_background = X_transformed_sample_model
+        background_source = "sampled explanation data"
     else:
-        X_transformed_background = None
+        X_transformed_background = to_dense_array(
+            feature_transformer.transform(X_background)
+        )
+    background_rows = X_transformed_background.shape[0]
 
     if (
         X_transformed_background is not None
@@ -942,34 +1034,41 @@ for model_record in model_records:
 
     explainer, model_explainer_name = build_explainer(
         estimator,
-        estimator_name,
         X_transformed_background,
+        class_labels,
+        model_display_feature_names,
     )
-    shap_by_class_model = normalize_shap_values(
-        explainer.shap_values(X_transformed_sample_model),
-        n_classes=len(class_labels),
+    shap_by_output_model, model_shap_output_labels = reshape_shap_values_container(
+        explainer(X_transformed_sample_model),
+        class_labels=class_labels,
     )
+    if shap_output_labels is None:
+        shap_output_labels = model_shap_output_labels
+    elif not np.array_equal(model_shap_output_labels, shap_output_labels):
+        raise ValueError(
+            f"SHAP output labels in {model_record['path']} do not match the first model."
+        )
 
     X_transformed_sample_by_model.append(X_transformed_sample_model)
-    shap_by_class_by_model.append(shap_by_class_model)
+    shap_by_output_by_model.append(shap_by_output_model)
     explainer_names.append(model_explainer_name)
 
 X_transformed_sample = np.mean(
     np.stack(X_transformed_sample_by_model, axis=0),
     axis=0,
 )
-shap_by_class = [
+shap_by_output = [
     np.mean(
         np.stack(
             [
-                model_shap_by_class[class_idx]
-                for model_shap_by_class in shap_by_class_by_model
+                model_shap_by_output[output_idx]
+                for model_shap_by_output in shap_by_output_by_model
             ],
             axis=0,
         ),
         axis=0,
     )
-    for class_idx in range(len(class_labels))
+    for output_idx in range(len(shap_output_labels))
 ]
 explainer_name = explainer_names[0]
 
@@ -986,6 +1085,10 @@ pd.DataFrame(
             model_record["estimator_name"] for model_record in model_records
         ],
         "explainer_name": explainer_names,
+        "shap_output_labels": [
+            ",".join(map(str, shap_output_labels))
+            for _ in model_records
+        ],
     }
 ).to_csv(
     out_dir / "model_explainers.csv",
@@ -1002,6 +1105,7 @@ sample_feature_df = pd.DataFrame(
 prediction_summary_df = pd.DataFrame(
     {
         "row_index": X.index.astype(str),
+        "data_source": data_source.to_numpy(),
         "true_label": y_true.to_numpy(),
         "pred_label": y_pred,
         "pred_probability": predicted_probabilities,
@@ -1050,33 +1154,43 @@ for grouping_name, group_labels in group_configs:
 
     heatmap_feature_union = []
     heatmap_rows = []
+    heatmap_row_labels = []
     bar_grid_items = []
     beeswarm_grid_items = []
 
-    overall_shap_values = select_row_aligned_shap_values(
-        shap_by_class,
-        class_labels,
+    all_classes_shap_values, all_classes_row_indices = build_row_matched_shap_values(
+        shap_by_output,
+        shap_output_labels,
         group_labels,
     )
     if is_fold_model_mode:
-        overall_model_shap_values = [
-            select_row_aligned_shap_values(
-                model_shap_by_class,
-                class_labels,
-                group_labels,
+        all_classes_model_shap_values = []
+        for model_shap_by_output in shap_by_output_by_model:
+            model_all_classes_shap_values, model_all_classes_row_indices = (
+                build_row_matched_shap_values(
+                    model_shap_by_output,
+                    shap_output_labels,
+                    group_labels,
+                )
             )
-            for model_shap_by_class in shap_by_class_by_model
-        ]
+            if not np.array_equal(
+                model_all_classes_row_indices,
+                all_classes_row_indices,
+            ):
+                raise ValueError(
+                    "Fold-level row-matched SHAP rows do not match averaged SHAP rows."
+                )
+            all_classes_model_shap_values.append(model_all_classes_shap_values)
     else:
-        overall_model_shap_values = None
+        all_classes_model_shap_values = None
 
-    overall_outputs = save_category_outputs(
-        category_label="Overall",
-        safe_label="overall",
-        category_shap_values=overall_shap_values,
-        category_model_shap_values=overall_model_shap_values,
+    all_classes_outputs = save_category_outputs(
+        category_label="all_classes",
+        safe_label="all_classes",
+        category_shap_values=all_classes_shap_values,
+        category_model_shap_values=all_classes_model_shap_values,
         model_labels=model_labels,
-        category_feature_df=sample_feature_df,
+        category_feature_df=sample_feature_df.iloc[all_classes_row_indices],
         raw_feature_names=raw_feature_names,
         display_feature_names=display_feature_names,
         top_features=args.top_features,
@@ -1088,26 +1202,28 @@ for grouping_name, group_labels in group_configs:
         dependence_dir=dependence_dir,
         mean_abs_shap_distributions_dir=mean_abs_shap_distributions_dir,
     )
-    heatmap_feature_union.extend(overall_outputs["heatmap_features"])
-    heatmap_rows.append(overall_outputs["heatmap_row"])
-    if overall_outputs["bar_grid_item"] is not None:
-        bar_grid_items.append(overall_outputs["bar_grid_item"])
-    if overall_outputs["beeswarm_grid_item"] is not None:
-        beeswarm_grid_items.append(overall_outputs["beeswarm_grid_item"])
+    heatmap_feature_union.extend(all_classes_outputs["heatmap_features"])
+    heatmap_rows.append(all_classes_outputs["heatmap_row"])
+    heatmap_row_labels.append("all_classes")
+    if all_classes_outputs["bar_grid_item"] is not None:
+        bar_grid_items.append(all_classes_outputs["bar_grid_item"])
+    if all_classes_outputs["beeswarm_grid_item"] is not None:
+        beeswarm_grid_items.append(all_classes_outputs["beeswarm_grid_item"])
 
-    for class_idx, class_label in enumerate(class_labels):
+    for output_idx, class_label in enumerate(shap_output_labels):
         class_mask = np.asarray(group_labels == class_label)
         safe_label = sanitize_label(class_label)
+        class_shap_values_all = shap_by_output[output_idx]
 
         if not np.any(class_mask):
             empty_outputs = save_category_outputs(
                 category_label=class_label,
                 safe_label=safe_label,
-                category_shap_values=shap_by_class[class_idx][class_mask],
+                category_shap_values=class_shap_values_all[class_mask],
                 category_model_shap_values=(
                     [
-                        model_shap_by_class[class_idx][class_mask]
-                        for model_shap_by_class in shap_by_class_by_model
+                        model_shap_by_output[output_idx][class_mask]
+                        for model_shap_by_output in shap_by_output_by_model
                     ]
                     if is_fold_model_mode
                     else None
@@ -1126,13 +1242,14 @@ for grouping_name, group_labels in group_configs:
                 mean_abs_shap_distributions_dir=mean_abs_shap_distributions_dir,
             )
             heatmap_rows.append(empty_outputs["heatmap_row"])
+            heatmap_row_labels.append(str(class_label))
             continue
 
-        class_shap_values = shap_by_class[class_idx][class_mask]
+        class_shap_values = class_shap_values_all[class_mask]
         if is_fold_model_mode:
             class_model_shap_values = [
-                model_shap_by_class[class_idx][class_mask]
-                for model_shap_by_class in shap_by_class_by_model
+                model_shap_by_output[output_idx][class_mask]
+                for model_shap_by_output in shap_by_output_by_model
             ]
         else:
             class_model_shap_values = None
@@ -1158,6 +1275,7 @@ for grouping_name, group_labels in group_configs:
         )
         heatmap_feature_union.extend(class_outputs["heatmap_features"])
         heatmap_rows.append(class_outputs["heatmap_row"])
+        heatmap_row_labels.append(str(class_label))
         if class_outputs["bar_grid_item"] is not None:
             bar_grid_items.append(class_outputs["bar_grid_item"])
         if class_outputs["beeswarm_grid_item"] is not None:
@@ -1166,12 +1284,12 @@ for grouping_name, group_labels in group_configs:
     heatmap_features = pd.Index(heatmap_feature_union).unique()
     if len(heatmap_features) == 0:
         heatmap_df = pd.DataFrame(
-            index=["Overall"] + [str(label) for label in class_labels]
+            index=heatmap_row_labels
         )
     else:
         heatmap_df = pd.DataFrame(
             heatmap_rows,
-            index=["Overall"] + [str(label) for label in class_labels],
+            index=heatmap_row_labels,
         ).reindex(columns=heatmap_features, fill_value=0.0)
         column_order = heatmap_df.max(axis=0).sort_values(ascending=False).index
         heatmap_df = heatmap_df.loc[:, column_order]
