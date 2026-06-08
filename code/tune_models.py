@@ -3,6 +3,14 @@
 
 # sbatch -J tune_models_progb_vs_nonprogb_selectkbest_p005_top5 -p long --mem=100G --cpus-per-task=11 --output=logs/%x.log.out --error=logs/%x.log.err --wrap="python tune_models.py --n-jobs 10 --mlflow-experiment-name progb_vs_nonprogb_selectkbest_p005_top5 --train-path /well/immune-rep/users/yfg436/git/ml-tabular/results/select_features/progb_vs_nonprogb_selectkbest_p005/train.csv --test-path /well/immune-rep/users/yfg436/git/ml-tabular/results/select_features/progb_vs_nonprogb_selectkbest_p005/test.csv --target-column is_progb"
 
+# sbatch -J tune_models_progb_vs_nonprogb_selectkbest_p005_nocorr_smartcorr_c09 -p long --mem=100G --cpus-per-task=11 --output=logs/%x.log.out --error=logs/%x.log.err --wrap="python tune_models.py --n-jobs 10 --mlflow-experiment-name progb_vs_nonprogb_selectkbest_p005_no_correlated_selection_smartcorrelation_c09 --train-path /well/immune-rep/users/yfg436/git/ml-tabular/results/select_features/progb_vs_nonprogb_selectkbest_p005_no_correlated_selection_smartcorrelation_c09/train.csv --test-path /well/immune-rep/users/yfg436/git/ml-tabular/results/select_features/progb_vs_nonprogb_selectkbest_p005_no_correlated_selection_smartcorrelation_c09/test.csv --target-column is_progb"
+
+# sbatch -J tune_models_progb_vs_nonprogb_selectkbest_p005_nocorr_summary -p long --mem=100G --cpus-per-task=11 --output=logs/%x.log.out --error=logs/%x.log.err --wrap="python tune_models.py --n-jobs 10 --mlflow-experiment-name progb_vs_nonprogb_selectkbest_p005_no_correlated_selection --train-path /well/immune-rep/users/yfg436/git/ml-tabular/results/summarise_bootstrap_features/progb_vs_nonprogb_selectkbest_p005_no_correlated_selection/train.csv --test-path /well/immune-rep/users/yfg436/git/ml-tabular/results/summarise_bootstrap_features/progb_vs_nonprogb_selectkbest_p005_no_correlated_selection/test.csv --target-column is_progb"
+
+# sbatch -J tune_models_progb_vs_nonprogb_sfp_auc_nocorr_summary -p long --mem=300G --cpus-per-task=11 --output=logs/%x.log.out --error=logs/%x.log.err --wrap="python tune_models.py --n-jobs 10 --mlflow-experiment-name progb_vs_nonprogb_singlefeatureperformance_auc_no_correlated_selection --train-path /well/immune-rep/users/yfg436/git/ml-tabular/results/summarise_bootstrap_features/progb_vs_nonprogb_singlefeatureperformance_auc_no_correlated_selection/train.csv --test-path /well/immune-rep/users/yfg436/git/ml-tabular/results/summarise_bootstrap_features/progb_vs_nonprogb_singlefeatureperformance_auc_no_correlated_selection/test.csv --target-column is_progb"
+
+# sbatch -J tune_models_progb_vs_nonprogb_sfp_auc_nocorr_smartcorr_c09 -p long --mem=300G --cpus-per-task=11 --output=logs/%x.log.out --error=logs/%x.log.err --wrap="python tune_models.py --n-jobs 10 --mlflow-experiment-name progb_vs_nonprogb_singlefeatureperformance_auc_no_correlated_selection_smartcorrelation_c09 --train-path /well/immune-rep/users/yfg436/git/ml-tabular/results/select_features/progb_vs_nonprogb_singlefeatureperformance_auc_no_correlated_selection_smartcorrelation_c09/train.csv --test-path /well/immune-rep/users/yfg436/git/ml-tabular/results/select_features/progb_vs_nonprogb_singlefeatureperformance_auc_no_correlated_selection_smartcorrelation_c09/test.csv --target-column is_progb"
+
 import argparse
 import joblib
 import os
@@ -39,6 +47,7 @@ top_models_to_tune = [
     "RandomForestClassifier",
     "LinearSVC",
     "LinearDiscriminantAnalysis",
+    "LogisticRegression"
 ]
 
 random_state = 123
@@ -77,11 +86,29 @@ parser.add_argument(
     default="label",
     help="Target column name in train and test CSVs.",
 )
+parser.add_argument(
+    "--ci-bootstrap-n",
+    type=int,
+    default=200,
+    help="Number of held-out test bootstrap resamples used for score CIs.",
+)
+parser.add_argument(
+    "--ci-alpha",
+    type=float,
+    default=0.05,
+    help="Alpha for confidence intervals. Default 0.05 gives 95%% intervals.",
+)
 args = parser.parse_args()
 
 n_jobs = args.n_jobs
 if n_jobs < 1:
     raise ValueError("n_jobs must be at least 1")
+ci_bootstrap_n = args.ci_bootstrap_n
+if ci_bootstrap_n < 1:
+    raise ValueError("ci_bootstrap_n must be at least 1")
+ci_alpha = args.ci_alpha
+if not 0 < ci_alpha < 1:
+    raise ValueError("ci_alpha must be between 0 and 1")
 
 mlflow_experiment_name = args.mlflow_experiment_name
 out_dir = os.path.join("..", "results", "tune_models", mlflow_experiment_name)
@@ -96,25 +123,32 @@ train_path = args.train_path
 test_path = args.test_path
 target_column = args.target_column
 
-optuna_comparison_path = os.path.join(out_dir, "optuna_model_comparison.csv")
-calibration_comparison_path = os.path.join(out_dir, "calibration_comparison.csv")
-calibration_bins_path = os.path.join(out_dir, "calibration_bins.csv")
-confidence_threshold_summary_path = os.path.join(
-    out_dir,
-    "confidence_threshold_summary.csv",
+tables_dir = os.path.join(out_dir, "tables")
+plots_dir = os.path.join(out_dir, "plots")
+calibrated_models_dir = os.path.join(out_dir, "calibrated_models")
+uncalibrated_models_dir = os.path.join(out_dir, "uncalibrated_models")
+cv_fold_model_root_dir = os.path.join(out_dir, "cv_fold_models")
+
+for output_subdir in [
+    tables_dir,
+    plots_dir,
+    calibrated_models_dir,
+    uncalibrated_models_dir,
+    cv_fold_model_root_dir,
+]:
+    os.makedirs(output_subdir, exist_ok=True)
+
+optuna_comparison_path = os.path.join(tables_dir, "optuna_model_comparison.csv")
+model_score_confidence_intervals_path = os.path.join(
+    tables_dir,
+    "model_score_confidence_intervals.csv",
 )
-final_model_calibrated_path = os.path.join(out_dir, "final_model_calibrated.pkl")
-final_model_uncalibrated_path = os.path.join(out_dir, "final_model_uncalibrated.pkl")
-cv_fold_model_dir = os.path.join(out_dir, "cv_fold_models", "uncalibrated")
-cv_fold_model_summary_path = os.path.join(out_dir, "cv_fold_model_summary.csv")
-cv_fold_assignments_path = os.path.join(out_dir, "cv_fold_assignments.csv")
-plot_model_comparison_path = os.path.join(out_dir, "plot_model_comparison.png")
-plot_cv_score_spread_path = os.path.join(out_dir, "plot_cv_score_spread.png")
-plot_final_model_scores_path = os.path.join(out_dir, "plot_final_model_scores.png")
-plot_reliability_comparison_path = os.path.join(
-    out_dir,
-    "plot_reliability_comparison.png",
+plot_model_comparison_path = os.path.join(plots_dir, "plot_model_comparison.png")
+plot_model_comparison_confidence_path = os.path.join(
+    plots_dir,
+    "plot_model_comparison_confidence.png",
 )
+plot_cv_score_spread_path = os.path.join(plots_dir, "plot_cv_score_spread.png")
 
 # Set to False if preprocessing can produce a sparse matrix, for example after one-hot encoding.
 stdscaler_with_mean = True
@@ -375,28 +409,158 @@ def log_metric_if_valid(name, value):
         mlflow.log_metric(name, float(value))
 
 
-def compute_score(model, X, y, scoring_metric, num_classes):
+def get_model_scores_for_metric(model, X, scoring_metric, num_classes):
+    pred = np.asarray(model.predict(X)).reshape(-1)
+    proba = None
+    proba_or_score = None
+
     if scoring_metric in {"roc_auc", "roc_auc_ovr", "roc_auc_ovo"}:
         if hasattr(model, "predict_proba"):
             proba = model.predict_proba(X)
             if num_classes == 2:
-                return roc_auc_score(y, proba[:, 1])
+                proba_or_score = proba[:, 1]
+            else:
+                proba_or_score = proba
+
+        elif num_classes == 2 and hasattr(model, "decision_function"):
+            proba_or_score = np.asarray(model.decision_function(X)).reshape(-1)
+
+    return {
+        "pred": pred,
+        "proba_or_score": proba_or_score,
+        "proba": proba,
+    }
+
+
+def compute_metric_from_predictions(
+    y_true,
+    pred,
+    proba_or_score,
+    scoring_metric,
+    num_classes,
+):
+    y_true = np.asarray(y_true)
+    pred = None if pred is None else np.asarray(pred).reshape(-1)
+
+    try:
+        if scoring_metric in {"roc_auc", "roc_auc_ovr", "roc_auc_ovo"}:
+            if proba_or_score is None:
+                return np.nan
+            if num_classes == 2:
+                return roc_auc_score(y_true, proba_or_score)
             multi_class_mode = "ovo" if scoring_metric == "roc_auc_ovo" else "ovr"
             return roc_auc_score(
-                y, proba, multi_class=multi_class_mode, average="macro"
+                y_true,
+                proba_or_score,
+                multi_class=multi_class_mode,
+                average="macro",
             )
 
-        if num_classes == 2 and hasattr(model, "decision_function"):
-            decision_scores = model.decision_function(X)
-            return roc_auc_score(y, decision_scores)
-
+        if scoring_metric == "accuracy":
+            if pred is None:
+                return np.nan
+            return accuracy_score(y_true, pred)
+    except ValueError:
         return np.nan
 
-    if scoring_metric == "accuracy":
-        pred = np.asarray(model.predict(X)).reshape(-1)
-        return accuracy_score(y, pred)
-
     return np.nan
+
+
+def compute_score(model, X, y, scoring_metric, num_classes):
+    model_scores = get_model_scores_for_metric(
+        model,
+        X,
+        scoring_metric=scoring_metric,
+        num_classes=num_classes,
+    )
+    return compute_metric_from_predictions(
+        y,
+        model_scores["pred"],
+        model_scores["proba_or_score"],
+        scoring_metric=scoring_metric,
+        num_classes=num_classes,
+    )
+
+
+def bootstrap_metric_ci(
+    y_true,
+    pred,
+    proba_or_score,
+    scoring_metric,
+    num_classes,
+    n_bootstrap,
+    alpha,
+    random_state,
+):
+    y_true = np.asarray(y_true)
+    pred = None if pred is None else np.asarray(pred).reshape(-1)
+    proba_or_score = (
+        None
+        if proba_or_score is None
+        else np.asarray(proba_or_score)
+    )
+    rng = np.random.default_rng(random_state)
+    class_to_indices = {
+        class_label: np.where(y_true == class_label)[0]
+        for class_label in np.unique(y_true)
+    }
+    bootstrap_scores = []
+
+    for _ in range(n_bootstrap):
+        sampled_indices = np.concatenate(
+            [
+                rng.choice(indices, size=len(indices), replace=True)
+                for indices in class_to_indices.values()
+            ]
+        )
+        rng.shuffle(sampled_indices)
+
+        sampled_pred = None if pred is None else pred[sampled_indices]
+        sampled_score = (
+            None
+            if proba_or_score is None
+            else proba_or_score[sampled_indices]
+        )
+        score = compute_metric_from_predictions(
+            y_true[sampled_indices],
+            sampled_pred,
+            sampled_score,
+            scoring_metric=scoring_metric,
+            num_classes=num_classes,
+        )
+        if not np.isnan(score):
+            bootstrap_scores.append(float(score))
+
+    if not bootstrap_scores:
+        return {
+            "ci_low": np.nan,
+            "ci_high": np.nan,
+            "n_valid": 0,
+        }
+
+    return {
+        "ci_low": float(np.percentile(bootstrap_scores, 100 * alpha / 2)),
+        "ci_high": float(np.percentile(bootstrap_scores, 100 * (1 - alpha / 2))),
+        "n_valid": len(bootstrap_scores),
+    }
+
+
+def percentile_interval(values, alpha):
+    values = np.asarray(values, dtype=float)
+    values = values[~np.isnan(values)]
+    if len(values) == 0:
+        return {
+            "score": np.nan,
+            "ci_low": np.nan,
+            "ci_high": np.nan,
+            "n_valid": 0,
+        }
+    return {
+        "score": float(np.mean(values)),
+        "ci_low": float(np.percentile(values, 100 * alpha / 2)),
+        "ci_high": float(np.percentile(values, 100 * (1 - alpha / 2))),
+        "n_valid": len(values),
+    }
 
 
 def save_best_param_cv_fold_models(
@@ -480,13 +644,39 @@ def save_best_param_cv_fold_models(
 
 def plot_model_comparison(results_df, scoring_metric, out_path):
     plot_df = results_df.copy()
+    score_columns = [
+        ("best_score", "selection_cv", "#4C78A8"),
+        ("uncalibrated_test_score", "uncalibrated_test", "#F58518"),
+        ("calibrated_test_score", "calibrated_test", "#54A24B"),
+    ]
 
     fig, ax = plt.subplots(figsize=(8, 5))
-    ax.bar(plot_df["model_name"], plot_df["best_score"], color="steelblue")
+    x_positions = np.arange(len(plot_df))
+    bar_width = 0.25
+
+    for score_idx, (score_column, label, color) in enumerate(score_columns):
+        offsets = x_positions + (score_idx - 1) * bar_width
+        values = plot_df[score_column].to_numpy(dtype=float)
+        ax.bar(offsets, values, width=bar_width, label=label, color=color)
+
+        for x_pos, value in zip(offsets, values):
+            if not np.isnan(value):
+                ax.text(
+                    x_pos,
+                    value,
+                    f"{value:.3f}",
+                    ha="center",
+                    va="bottom",
+                    fontsize=7,
+                    rotation=90,
+                )
+
+    ax.set_xticks(x_positions)
+    ax.set_xticklabels(plot_df["model_name"], rotation=45, ha="right")
     ax.set_xlabel("Model family")
-    ax.set_ylabel(f"Best CV score: {scoring_metric}")
-    ax.set_title("Model comparison")
-    ax.tick_params(axis="x", rotation=45)
+    ax.set_ylabel(f"Score: {scoring_metric}")
+    ax.set_title("Model comparison: CV selection vs held-out test")
+    ax.legend()
 
     best_idx = plot_df["best_score"].idxmax()
     best_name = plot_df.loc[best_idx, "model_name"]
@@ -500,6 +690,76 @@ def plot_model_comparison(results_df, scoring_metric, out_path):
         ha="left",
         va="top",
     )
+
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=300)
+    plt.close(fig)
+
+
+def plot_model_comparison_confidence(confidence_df, scoring_metric, out_path):
+    plot_df = confidence_df[
+        confidence_df["score_source"].isin(
+            ["selection_cv", "uncalibrated_test", "calibrated_test"]
+        )
+    ].copy()
+    score_sources = [
+        ("selection_cv", "selection_cv", "#4C78A8"),
+        ("uncalibrated_test", "uncalibrated_test", "#F58518"),
+        ("calibrated_test", "calibrated_test", "#54A24B"),
+    ]
+    model_names = list(plot_df["model_name"].drop_duplicates())
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    x_positions = np.arange(len(model_names))
+    bar_width = 0.25
+
+    for score_idx, (score_source, label, color) in enumerate(score_sources):
+        source_df = (
+            plot_df[plot_df["score_source"] == score_source]
+            .set_index("model_name")
+            .reindex(model_names)
+        )
+        offsets = x_positions + (score_idx - 1) * bar_width
+        values = source_df["score"].to_numpy(dtype=float)
+        ci_low = source_df["ci_low"].to_numpy(dtype=float)
+        ci_high = source_df["ci_high"].to_numpy(dtype=float)
+        lower_errors = np.maximum(values - ci_low, 0.0)
+        upper_errors = np.maximum(ci_high - values, 0.0)
+        yerr = np.vstack(
+            [
+                np.where(np.isnan(lower_errors), 0.0, lower_errors),
+                np.where(np.isnan(upper_errors), 0.0, upper_errors),
+            ]
+        )
+
+        ax.bar(
+            offsets,
+            values,
+            width=bar_width,
+            yerr=yerr,
+            capsize=3,
+            label=label,
+            color=color,
+        )
+
+        for x_pos, value in zip(offsets, values):
+            if not np.isnan(value):
+                ax.text(
+                    x_pos,
+                    value,
+                    f"{value:.3f}",
+                    ha="center",
+                    va="bottom",
+                    fontsize=7,
+                    rotation=90,
+                )
+
+    ax.set_xticks(x_positions)
+    ax.set_xticklabels(model_names, rotation=45, ha="right")
+    ax.set_xlabel("Model family")
+    ax.set_ylabel(f"Score: {scoring_metric}")
+    ax.set_title("Model comparison with confidence intervals")
+    ax.legend()
 
     fig.tight_layout()
     fig.savefig(out_path, dpi=300)
@@ -550,7 +810,7 @@ def plot_cv_score_spread(results_df, scoring_metric, out_path):
     plt.close(fig)
 
 
-def plot_final_model_scores(
+def plot_model_scores(
     best_model_name,
     selection_cv_score,
     uncalibrated_test_score,
@@ -592,22 +852,82 @@ def plot_final_model_scores(
     plt.close(fig)
 
 
-def summarise_calibration(model, X, y, scoring_metric, num_classes, bin_edges, thresholds):
+def summarise_calibration(
+    model,
+    X,
+    y,
+    scoring_metric,
+    num_classes,
+    bin_edges,
+    thresholds,
+    ci_bootstrap_n,
+    ci_alpha,
+    random_state,
+):
     y_series = pd.Series(y).reset_index(drop=True)
-    proba = model.predict_proba(X)
-    pred = model.predict(X)
-    pred = np.asarray(pred).reshape(-1)
-    pred = pd.Series(pred).reset_index(drop=True)
-    confidence = proba.max(axis=1)
-    correct = (pred.values == y_series.values).astype(float)
-
-    score_value = compute_score(
+    model_scores = get_model_scores_for_metric(
         model,
         X,
-        y,
         scoring_metric=scoring_metric,
         num_classes=num_classes,
     )
+    pred = pd.Series(model_scores["pred"]).reset_index(drop=True)
+    score_value = compute_metric_from_predictions(
+        y,
+        model_scores["pred"],
+        model_scores["proba_or_score"],
+        scoring_metric=scoring_metric,
+        num_classes=num_classes,
+    )
+    score_ci = bootstrap_metric_ci(
+        y,
+        model_scores["pred"],
+        model_scores["proba_or_score"],
+        scoring_metric=scoring_metric,
+        num_classes=num_classes,
+        n_bootstrap=ci_bootstrap_n,
+        alpha=ci_alpha,
+        random_state=random_state,
+    )
+
+    if model_scores["proba"] is None:
+        bin_rows = [
+            {
+                "bin_lower": float(bin_edges[bin_idx]),
+                "bin_upper": float(bin_edges[bin_idx + 1]),
+                "count": 0,
+                "mean_confidence": np.nan,
+                "empirical_accuracy": np.nan,
+            }
+            for bin_idx in range(len(bin_edges) - 1)
+        ]
+        threshold_rows = [
+            {
+                "threshold": float(threshold),
+                "retained_count": np.nan,
+                "retained_fraction": np.nan,
+                "retained_accuracy": np.nan,
+            }
+            for threshold in thresholds
+        ]
+        summary = {
+            "score": float(score_value) if not np.isnan(score_value) else np.nan,
+            "score_ci_low": score_ci["ci_low"],
+            "score_ci_high": score_ci["ci_high"],
+            "score_ci_method": "stratified_test_bootstrap",
+            "score_ci_n_valid": score_ci["n_valid"],
+            "log_loss": np.nan,
+            "ece": np.nan,
+        }
+        return (
+            summary,
+            pd.DataFrame(bin_rows),
+            pd.DataFrame(threshold_rows),
+        )
+
+    proba = model_scores["proba"]
+    confidence = proba.max(axis=1)
+    correct = (pred.values == y_series.values).astype(float)
     log_loss_value = log_loss(y_series, proba, labels=list(model.classes_))
 
     bin_ids = np.digitize(confidence, bin_edges[1:-1], right=False)
@@ -653,6 +973,10 @@ def summarise_calibration(model, X, y, scoring_metric, num_classes, bin_edges, t
 
     summary = {
         "score": float(score_value) if not np.isnan(score_value) else np.nan,
+        "score_ci_low": score_ci["ci_low"],
+        "score_ci_high": score_ci["ci_high"],
+        "score_ci_method": "stratified_test_bootstrap",
+        "score_ci_n_valid": score_ci["n_valid"],
         "log_loss": float(log_loss_value),
         "ece": float(ece),
     }
@@ -725,7 +1049,6 @@ mlflow.set_experiment(mlflow_experiment_name)
 
 overall_start = time.perf_counter()
 results = []
-studies = {}
 
 for lazy_name in top_models_to_tune:
     if lazy_name not in MODEL_NAME_MAP:
@@ -751,7 +1074,6 @@ for lazy_name in top_models_to_tune:
             n_jobs=n_jobs,
         )
 
-        studies[model_name] = study
         mlflow.log_metric("best_score", study.best_value)
 
         for key, value in study.best_params.items():
@@ -768,12 +1090,385 @@ for lazy_name in top_models_to_tune:
         )
 
 results_df = pd.DataFrame(results).sort_values("best_score", ascending=False)
+best_model_name = results_df.iloc[0]["model_name"]
+num_classes = len(np.unique(y_train))
+
+bin_edges = np.linspace(0.0, 1.0, 11)
+confidence_thresholds = [0.50, 0.60, 0.70, 0.80, 0.90, 0.95]
+model_metric_rows = []
+model_score_ci_rows = []
+
+for _, model_row in results_df.iterrows():
+    lazy_name = model_row["lazy_name"]
+    model_name = model_row["model_name"]
+    best_params = model_row["best_params"]
+    selection_cv_score = float(model_row["best_score"])
+
+    uncalibrated_model_path = os.path.join(
+        uncalibrated_models_dir,
+        f"{model_name}__model_uncalibrated.pkl",
+    )
+    calibrated_model_path = os.path.join(
+        calibrated_models_dir,
+        f"{model_name}__model_calibrated.pkl",
+    )
+    calibration_comparison_path = os.path.join(
+        tables_dir,
+        f"{model_name}__calibration_comparison.csv",
+    )
+    calibration_bins_path = os.path.join(
+        tables_dir,
+        f"{model_name}__calibration_bins.csv",
+    )
+    confidence_threshold_summary_path = os.path.join(
+        tables_dir,
+        f"{model_name}__confidence_threshold_summary.csv",
+    )
+    model_scores_plot_path = os.path.join(
+        plots_dir,
+        f"{model_name}_model_scores.png",
+    )
+    reliability_plot_path = os.path.join(
+        plots_dir,
+        f"{model_name}__reliability_comparison.png",
+    )
+    cv_fold_model_dir = os.path.join(
+        cv_fold_model_root_dir,
+        model_name,
+        "uncalibrated",
+    )
+    cv_fold_model_summary_path = os.path.join(
+        tables_dir,
+        f"{model_name}__cv_fold_model_summary.csv",
+    )
+    cv_fold_assignments_path = os.path.join(
+        tables_dir,
+        f"{model_name}__cv_fold_assignments.csv",
+    )
+
+    cv_fold_model_summary_df, cv_fold_assignments_df = save_best_param_cv_fold_models(
+        best_model_name=model_name,
+        best_params=best_params,
+        X_train=X_train,
+        y_train=y_train,
+        cv=cv,
+        scoring_metric=scoring_metric,
+        num_classes=num_classes,
+        cv_fold_model_dir=cv_fold_model_dir,
+        cv_fold_model_summary_path=cv_fold_model_summary_path,
+        cv_fold_assignments_path=cv_fold_assignments_path,
+    )
+    selection_cv_interval = percentile_interval(
+        cv_fold_model_summary_df["validation_score"],
+        alpha=ci_alpha,
+    )
+    model_score_ci_rows.append(
+        {
+            "lazy_name": lazy_name,
+            "model_name": model_name,
+            "score_source": "selection_cv",
+            "score": selection_cv_interval["score"],
+            "ci_low": selection_cv_interval["ci_low"],
+            "ci_high": selection_cv_interval["ci_high"],
+            "ci_method": "cv_fold_percentile",
+            "n_valid": selection_cv_interval["n_valid"],
+        }
+    )
+
+    uncalibrated_pipeline = build_pipeline(
+        FixedTrial(best_params),
+        model_name,
+        fit_label=f"{model_name}_uncalibrated",
+    )
+    uncalibrated_pipeline.fit(X_train, y_train)
+
+    calibration_pipeline = build_pipeline(
+        FixedTrial(best_params),
+        model_name,
+        fit_label=f"{model_name}_calibrated",
+    )
+    calibrated_model = CalibratedClassifierCV(
+        estimator=calibration_pipeline,
+        method="sigmoid",
+        cv=cv,
+        ensemble=False,
+    )
+    calibrated_model.fit(X_train, y_train)
+
+    uncalibrated_summary, uncalibrated_bins_df, uncalibrated_thresholds_df = (
+        summarise_calibration(
+            uncalibrated_pipeline,
+            X_test,
+            y_test,
+            scoring_metric=scoring_metric,
+            num_classes=num_classes,
+            bin_edges=bin_edges,
+            thresholds=confidence_thresholds,
+            ci_bootstrap_n=ci_bootstrap_n,
+            ci_alpha=ci_alpha,
+            random_state=random_state,
+        )
+    )
+    (
+        calibrated_summary,
+        calibrated_bins_df,
+        calibrated_thresholds_df,
+    ) = summarise_calibration(
+        calibrated_model,
+        X_test,
+        y_test,
+        scoring_metric=scoring_metric,
+        num_classes=num_classes,
+        bin_edges=bin_edges,
+        thresholds=confidence_thresholds,
+        ci_bootstrap_n=ci_bootstrap_n,
+        ci_alpha=ci_alpha,
+        random_state=random_state,
+    )
+    model_score_ci_rows.extend(
+        [
+            {
+                "lazy_name": lazy_name,
+                "model_name": model_name,
+                "score_source": "uncalibrated_test",
+                "score": uncalibrated_summary["score"],
+                "ci_low": uncalibrated_summary["score_ci_low"],
+                "ci_high": uncalibrated_summary["score_ci_high"],
+                "ci_method": uncalibrated_summary["score_ci_method"],
+                "n_valid": uncalibrated_summary["score_ci_n_valid"],
+            },
+            {
+                "lazy_name": lazy_name,
+                "model_name": model_name,
+                "score_source": "calibrated_test",
+                "score": calibrated_summary["score"],
+                "ci_low": calibrated_summary["score_ci_low"],
+                "ci_high": calibrated_summary["score_ci_high"],
+                "ci_method": calibrated_summary["score_ci_method"],
+                "n_valid": calibrated_summary["score_ci_n_valid"],
+            },
+        ]
+    )
+
+    calibration_comparison_df = pd.DataFrame(
+        [
+            {
+                "model_family": model_name,
+                "model_version": "uncalibrated",
+                "selection_cv_score": selection_cv_score,
+                "test_score": uncalibrated_summary["score"],
+                "test_score_ci_low": uncalibrated_summary["score_ci_low"],
+                "test_score_ci_high": uncalibrated_summary["score_ci_high"],
+                "test_score_ci_method": uncalibrated_summary["score_ci_method"],
+                "test_score_ci_n_valid": uncalibrated_summary["score_ci_n_valid"],
+                "log_loss": uncalibrated_summary["log_loss"],
+                "ece": uncalibrated_summary["ece"],
+            },
+            {
+                "model_family": model_name,
+                "model_version": "calibrated",
+                "selection_cv_score": selection_cv_score,
+                "test_score": calibrated_summary["score"],
+                "test_score_ci_low": calibrated_summary["score_ci_low"],
+                "test_score_ci_high": calibrated_summary["score_ci_high"],
+                "test_score_ci_method": calibrated_summary["score_ci_method"],
+                "test_score_ci_n_valid": calibrated_summary["score_ci_n_valid"],
+                "log_loss": calibrated_summary["log_loss"],
+                "ece": calibrated_summary["ece"],
+            },
+        ]
+    )
+
+    calibration_bins_df = pd.concat(
+        [
+            uncalibrated_bins_df.assign(
+                model_family=model_name,
+                model_version="uncalibrated",
+            ),
+            calibrated_bins_df.assign(
+                model_family=model_name,
+                model_version="calibrated",
+            ),
+        ],
+        ignore_index=True,
+    )
+
+    confidence_threshold_summary_df = pd.concat(
+        [
+            uncalibrated_thresholds_df.assign(
+                model_family=model_name,
+                model_version="uncalibrated",
+            ),
+            calibrated_thresholds_df.assign(
+                model_family=model_name,
+                model_version="calibrated",
+            ),
+        ],
+        ignore_index=True,
+    )
+
+    calibration_comparison_df.to_csv(calibration_comparison_path, index=False)
+    calibration_bins_df.to_csv(calibration_bins_path, index=False)
+    confidence_threshold_summary_df.to_csv(
+        confidence_threshold_summary_path,
+        index=False,
+    )
+
+    joblib.dump(uncalibrated_pipeline, uncalibrated_model_path)
+    joblib.dump(calibrated_model, calibrated_model_path)
+
+    plot_model_scores(
+        best_model_name=model_name,
+        selection_cv_score=selection_cv_score,
+        uncalibrated_test_score=uncalibrated_summary["score"],
+        calibrated_test_score=calibrated_summary["score"],
+        scoring_metric=scoring_metric,
+        out_path=model_scores_plot_path,
+    )
+
+    plot_reliability_comparison(
+        calibration_bins_df=calibration_bins_df,
+        out_path=reliability_plot_path,
+    )
+
+    model_metric_rows.append(
+        {
+            "lazy_name": lazy_name,
+            "model_name": model_name,
+            "uncalibrated_test_score": uncalibrated_summary["score"],
+            "uncalibrated_test_score_ci_low": uncalibrated_summary["score_ci_low"],
+            "uncalibrated_test_score_ci_high": uncalibrated_summary["score_ci_high"],
+            "uncalibrated_test_score_ci_n_valid": uncalibrated_summary["score_ci_n_valid"],
+            "uncalibrated_test_score_ci_method": uncalibrated_summary["score_ci_method"],
+            "calibrated_test_score": calibrated_summary["score"],
+            "calibrated_test_score_ci_low": calibrated_summary["score_ci_low"],
+            "calibrated_test_score_ci_high": calibrated_summary["score_ci_high"],
+            "calibrated_test_score_ci_n_valid": calibrated_summary["score_ci_n_valid"],
+            "calibrated_test_score_ci_method": calibrated_summary["score_ci_method"],
+            "uncalibrated_test_log_loss": uncalibrated_summary["log_loss"],
+            "calibrated_test_log_loss": calibrated_summary["log_loss"],
+            "uncalibrated_test_ece": uncalibrated_summary["ece"],
+            "calibrated_test_ece": calibrated_summary["ece"],
+        }
+    )
+
+    with mlflow.start_run(run_name=f"model_{model_name}"):
+        log_data_source_params()
+        mlflow.log_param("model_family", model_name)
+        mlflow.log_param("lazy_name", lazy_name)
+        mlflow.log_param("selected_by_cv", model_name == best_model_name)
+        mlflow.log_param("cv_folds", cv.get_n_splits())
+        mlflow.log_param("scoring_metric", scoring_metric)
+        mlflow.log_param("calibration_method", "sigmoid")
+        mlflow.log_param("calibration_cv_folds", cv.get_n_splits())
+        mlflow.log_param("calibration_ensemble", False)
+        mlflow.log_param("n_jobs", n_jobs)
+        mlflow.log_param("ci_bootstrap_n", ci_bootstrap_n)
+        mlflow.log_param("ci_alpha", ci_alpha)
+        for key, value in best_params.items():
+            mlflow.log_param(f"best_{key}", value)
+        log_metric_if_valid("selection_cv_score", selection_cv_score)
+        log_metric_if_valid(
+            "selection_cv_refit_score",
+            selection_cv_interval["score"],
+        )
+        log_metric_if_valid(
+            "selection_cv_refit_ci_low",
+            selection_cv_interval["ci_low"],
+        )
+        log_metric_if_valid(
+            "selection_cv_refit_ci_high",
+            selection_cv_interval["ci_high"],
+        )
+        log_metric_if_valid("uncalibrated_test_score", uncalibrated_summary["score"])
+        log_metric_if_valid(
+            "uncalibrated_test_score_ci_low",
+            uncalibrated_summary["score_ci_low"],
+        )
+        log_metric_if_valid(
+            "uncalibrated_test_score_ci_high",
+            uncalibrated_summary["score_ci_high"],
+        )
+        log_metric_if_valid(
+            "uncalibrated_test_score_ci_n_valid",
+            uncalibrated_summary["score_ci_n_valid"],
+        )
+        log_metric_if_valid("calibrated_test_score", calibrated_summary["score"])
+        log_metric_if_valid(
+            "calibrated_test_score_ci_low",
+            calibrated_summary["score_ci_low"],
+        )
+        log_metric_if_valid(
+            "calibrated_test_score_ci_high",
+            calibrated_summary["score_ci_high"],
+        )
+        log_metric_if_valid(
+            "calibrated_test_score_ci_n_valid",
+            calibrated_summary["score_ci_n_valid"],
+        )
+        log_metric_if_valid(
+            "uncalibrated_test_log_loss",
+            uncalibrated_summary["log_loss"],
+        )
+        log_metric_if_valid("calibrated_test_log_loss", calibrated_summary["log_loss"])
+        log_metric_if_valid("uncalibrated_test_ece", uncalibrated_summary["ece"])
+        log_metric_if_valid("calibrated_test_ece", calibrated_summary["ece"])
+
+        mlflow.log_artifact(uncalibrated_model_path)
+        mlflow.log_artifact(calibrated_model_path)
+        mlflow.log_artifacts(
+            cv_fold_model_dir,
+            artifact_path=f"cv_fold_models/{model_name}/uncalibrated",
+        )
+        mlflow.log_artifact(cv_fold_model_summary_path)
+        mlflow.log_artifact(cv_fold_assignments_path)
+        mlflow.log_artifact(calibration_comparison_path)
+        mlflow.log_artifact(calibration_bins_path)
+        mlflow.log_artifact(confidence_threshold_summary_path)
+        mlflow.log_artifact(model_scores_plot_path)
+        mlflow.log_artifact(reliability_plot_path)
+        mlflow.sklearn.log_model(
+            calibrated_model,
+            artifact_path=f"{model_name}_sklearn_model",
+        )
+
+model_metrics_df = pd.DataFrame(model_metric_rows)
+results_df = results_df.merge(
+    model_metrics_df,
+    on=["lazy_name", "model_name"],
+    how="left",
+).sort_values("best_score", ascending=False)
 results_df.to_csv(optuna_comparison_path, index=False)
+
+model_score_ci_df = pd.DataFrame(model_score_ci_rows)
+model_order = {
+    model_name: model_idx
+    for model_idx, model_name in enumerate(results_df["model_name"].tolist())
+}
+score_source_order = {
+    "selection_cv": 0,
+    "uncalibrated_test": 1,
+    "calibrated_test": 2,
+}
+model_score_ci_df["_model_order"] = model_score_ci_df["model_name"].map(model_order)
+model_score_ci_df["_score_source_order"] = model_score_ci_df["score_source"].map(
+    score_source_order
+)
+model_score_ci_df = model_score_ci_df.sort_values(
+    ["_model_order", "_score_source_order"]
+).drop(columns=["_model_order", "_score_source_order"])
+model_score_ci_df.to_csv(model_score_confidence_intervals_path, index=False)
 
 plot_model_comparison(
     results_df=results_df,
     scoring_metric=scoring_metric,
     out_path=plot_model_comparison_path,
+)
+
+plot_model_comparison_confidence(
+    confidence_df=model_score_ci_df,
+    scoring_metric=scoring_metric,
+    out_path=plot_model_comparison_confidence_path,
 )
 
 plot_cv_score_spread(
@@ -785,200 +1480,28 @@ plot_cv_score_spread(
 with mlflow.start_run(run_name="model_comparison_summary"):
     log_data_source_params()
     mlflow.log_artifact(optuna_comparison_path)
+    mlflow.log_artifact(model_score_confidence_intervals_path)
     mlflow.log_artifact(plot_model_comparison_path)
+    mlflow.log_artifact(plot_model_comparison_confidence_path)
     mlflow.log_artifact(plot_cv_score_spread_path)
 
 print(results_df)
 
-best_model_name = results_df.iloc[0]["model_name"]
-best_lazy_name = results_df.iloc[0]["lazy_name"]
-best_study = studies[best_model_name]
-num_classes = len(np.unique(y_train))
-
-cv_fold_model_summary_df, cv_fold_assignments_df = save_best_param_cv_fold_models(
-    best_model_name=best_model_name,
-    best_params=best_study.best_params,
-    X_train=X_train,
-    y_train=y_train,
-    cv=cv,
-    scoring_metric=scoring_metric,
-    num_classes=num_classes,
-    cv_fold_model_dir=cv_fold_model_dir,
-    cv_fold_model_summary_path=cv_fold_model_summary_path,
-    cv_fold_assignments_path=cv_fold_assignments_path,
-)
-
-uncalibrated_final_pipeline = build_pipeline(
-    FixedTrial(best_study.best_params),
-    best_model_name,
-    fit_label="final_uncalibrated",
-)
-uncalibrated_final_pipeline.fit(X_train, y_train)
-
-best_pipeline = build_pipeline(
-    FixedTrial(best_study.best_params),
-    best_model_name,
-    fit_label="final_calibrated",
-)
-calibrated_model = CalibratedClassifierCV(
-    estimator=best_pipeline,
-    method="sigmoid",
-    cv=cv,
-    ensemble=False,
-)
-calibrated_model.fit(X_train, y_train)
-
-selection_cv_score = float(best_study.best_value)
-uncalibrated_test_score = compute_score(
-    uncalibrated_final_pipeline,
-    X_test,
-    y_test,
-    scoring_metric=scoring_metric,
-    num_classes=num_classes,
-)
-calibrated_test_score = compute_score(
-    calibrated_model,
-    X_test,
-    y_test,
-    scoring_metric=scoring_metric,
-    num_classes=num_classes,
-)
-
-bin_edges = np.linspace(0.0, 1.0, 11)
-confidence_thresholds = [0.50, 0.60, 0.70, 0.80, 0.90, 0.95]
-
-uncalibrated_summary, uncalibrated_bins_df, uncalibrated_thresholds_df = (
-    summarise_calibration(
-        uncalibrated_final_pipeline,
-        X_test,
-        y_test,
-        scoring_metric=scoring_metric,
-        num_classes=num_classes,
-        bin_edges=bin_edges,
-        thresholds=confidence_thresholds,
-    )
-)
-calibrated_summary, calibrated_bins_df, calibrated_thresholds_df = summarise_calibration(
-    calibrated_model,
-    X_test,
-    y_test,
-    scoring_metric=scoring_metric,
-    num_classes=num_classes,
-    bin_edges=bin_edges,
-    thresholds=confidence_thresholds,
-)
-
-calibration_comparison_df = pd.DataFrame(
-    [
-        {
-            "model_version": "uncalibrated",
-            "selection_cv_score": selection_cv_score,
-            "test_score": uncalibrated_summary["score"],
-            "log_loss": uncalibrated_summary["log_loss"],
-            "ece": uncalibrated_summary["ece"],
-        },
-        {
-            "model_version": "calibrated",
-            "selection_cv_score": selection_cv_score,
-            "test_score": calibrated_summary["score"],
-            "log_loss": calibrated_summary["log_loss"],
-            "ece": calibrated_summary["ece"],
-        },
-    ]
-)
-
-calibration_bins_df = pd.concat(
-    [
-        uncalibrated_bins_df.assign(model_version="uncalibrated"),
-        calibrated_bins_df.assign(model_version="calibrated"),
-    ],
-    ignore_index=True,
-)
-
-confidence_threshold_summary_df = pd.concat(
-    [
-        uncalibrated_thresholds_df.assign(model_version="uncalibrated"),
-        calibrated_thresholds_df.assign(model_version="calibrated"),
-    ],
-    ignore_index=True,
-)
-
-calibration_comparison_df.to_csv(calibration_comparison_path, index=False)
-calibration_bins_df.to_csv(calibration_bins_path, index=False)
-confidence_threshold_summary_df.to_csv(
-    confidence_threshold_summary_path,
-    index=False,
-)
-
-joblib.dump(uncalibrated_final_pipeline, final_model_uncalibrated_path)
-joblib.dump(calibrated_model, final_model_calibrated_path)
-
-plot_final_model_scores(
-    best_model_name=best_model_name,
-    selection_cv_score=selection_cv_score,
-    uncalibrated_test_score=uncalibrated_test_score,
-    calibrated_test_score=calibrated_test_score,
-    scoring_metric=scoring_metric,
-    out_path=plot_final_model_scores_path,
-)
-
-plot_reliability_comparison(
-    calibration_bins_df=calibration_bins_df,
-    out_path=plot_reliability_comparison_path,
-)
-
-with mlflow.start_run(run_name="final_model"):
-    log_data_source_params()
-    mlflow.log_param("winning_model_family", best_model_name)
-    mlflow.log_param("winning_lazy_name", best_lazy_name)
-    mlflow.log_param("cv_folds", cv.get_n_splits())
-    mlflow.log_param("scoring_metric", scoring_metric)
-    mlflow.log_param("calibration_method", "sigmoid")
-    mlflow.log_param("calibration_cv_folds", cv.get_n_splits())
-    mlflow.log_param("calibration_ensemble", False)
-    mlflow.log_param("n_jobs", n_jobs)
-    for key, value in best_study.best_params.items():
-        mlflow.log_param(f"best_{key}", value)
-    log_metric_if_valid("selection_cv_score", selection_cv_score)
-    log_metric_if_valid("uncalibrated_test_score", uncalibrated_summary["score"])
-    log_metric_if_valid("calibrated_test_score", calibrated_summary["score"])
-    log_metric_if_valid("uncalibrated_test_log_loss", uncalibrated_summary["log_loss"])
-    log_metric_if_valid("calibrated_test_log_loss", calibrated_summary["log_loss"])
-    log_metric_if_valid("uncalibrated_test_ece", uncalibrated_summary["ece"])
-    log_metric_if_valid("calibrated_test_ece", calibrated_summary["ece"])
-
-    mlflow.log_artifact(final_model_calibrated_path)
-    mlflow.log_artifact(final_model_uncalibrated_path)
-    mlflow.log_artifacts(
-        cv_fold_model_dir,
-        artifact_path="cv_fold_models_uncalibrated",
-    )
-    mlflow.log_artifact(cv_fold_model_summary_path)
-    mlflow.log_artifact(cv_fold_assignments_path)
-    mlflow.log_artifact(optuna_comparison_path)
-    mlflow.log_artifact(calibration_comparison_path)
-    mlflow.log_artifact(calibration_bins_path)
-    mlflow.log_artifact(confidence_threshold_summary_path)
-    mlflow.log_artifact(plot_final_model_scores_path)
-    mlflow.log_artifact(plot_reliability_comparison_path)
-    mlflow.sklearn.log_model(calibrated_model, artifact_path="final_sklearn_model")
+best_model_row = results_df.iloc[0]
 
 overall_duration = time.perf_counter() - overall_start
 
-print("Best model:", best_model_name)
+print("Best model:", best_model_row["model_name"])
 print("n_jobs:", n_jobs)
-print("Selection CV score:", selection_cv_score)
-print("Uncalibrated test score:", uncalibrated_test_score)
-print("Calibrated test score:", calibrated_test_score)
-print("Uncalibrated test log loss:", uncalibrated_summary["log_loss"])
-print("Calibrated test log loss:", calibrated_summary["log_loss"])
-print("Uncalibrated test ECE:", uncalibrated_summary["ece"])
-print("Calibrated test ECE:", calibrated_summary["ece"])
-print("Saved calibrated final model to", final_model_calibrated_path)
-print("Saved uncalibrated final model to", final_model_uncalibrated_path)
-print("Saved CV fold models to", cv_fold_model_dir)
-print("Saved CV fold model summary to", cv_fold_model_summary_path)
-print("Saved CV fold assignments to", cv_fold_assignments_path)
+print("Selection CV score:", best_model_row["best_score"])
+print("Uncalibrated test score:", best_model_row["uncalibrated_test_score"])
+print("Calibrated test score:", best_model_row["calibrated_test_score"])
+print("Uncalibrated test log loss:", best_model_row["uncalibrated_test_log_loss"])
+print("Calibrated test log loss:", best_model_row["calibrated_test_log_loss"])
+print("Uncalibrated test ECE:", best_model_row["uncalibrated_test_ece"])
+print("Calibrated test ECE:", best_model_row["calibrated_test_ece"])
+print("Saved model comparison to", optuna_comparison_path)
+print("Saved CV fold models to", cv_fold_model_root_dir)
 print(
     f"Total runtime (seconds): {overall_duration:.2f} "
     f"({overall_duration / 60:.2f} minutes)"
