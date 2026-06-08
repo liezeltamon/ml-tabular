@@ -28,6 +28,20 @@
 #     --selection-threshold 0.9 \
 #     --no-correlation-outputs"
 
+# cd /well/immune-rep/users/yfg436/git/ml-tabular/code
+# mkdir -p logs/summarise_bootstrap_features/progb_vs_nonprogb_singlefeatureperformance_auc_no_correlated_selection
+# sbatch -J summarise_bootstrap_sfp_auc_nocorr -p short,long --mem=15G \
+#   --output=logs/summarise_bootstrap_features/progb_vs_nonprogb_singlefeatureperformance_auc_no_correlated_selection/%x.log.out \
+#   --error=logs/summarise_bootstrap_features/progb_vs_nonprogb_singlefeatureperformance_auc_no_correlated_selection/%x.log.err \
+#   --wrap="python summarise_bootstrap_features.py \
+#     --bootstrap-root /well/immune-rep/users/yfg436/git/ml-tabular/results/select_features/progb_vs_nonprogb_singlefeatureperformance_auc_no_correlated_selection/bootstraps \
+#     --train-path /well/immune-rep/users/yfg436/git/sle/results/prediction/create_input_table/group_id_nonprogb_progb_missingness0_minuniqueNone/train.csv \
+#     --test-path /well/immune-rep/users/yfg436/git/sle/results/prediction/create_input_table/group_id_nonprogb_progb_missingness0_minuniqueNone/test.csv \
+#     --target-column is_progb \
+#     --out-dir /well/immune-rep/users/yfg436/git/ml-tabular/results/summarise_bootstrap_features/progb_vs_nonprogb_singlefeatureperformance_auc_no_correlated_selection \
+#     --selection-threshold 0.9 \
+#     --no-correlation-outputs"
+
 import argparse
 import os
 import re

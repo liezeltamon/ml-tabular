@@ -15,7 +15,7 @@ set -euo pipefail
 
 # cd /well/immune-rep/users/yfg436/git/ml-tabular/code
 # mkdir -p logs/select_features/progb_vs_nonprogb_singlefeatureperformance_auc_no_correlated_selection
-# UNIVARIATE_METHOD=single_feature_performance SKIP_CORRELATED_SELECTION=true sbatch --array=0-10 -J select_features_bootstrap_sfp_auc_nocorr -p short,long --mem=200G --output=logs/select_features/progb_vs_nonprogb_singlefeatureperformance_auc_no_correlated_selection/%x_%A_%a.log.out --error=logs/select_features/progb_vs_nonprogb_singlefeatureperformance_auc_no_correlated_selection/%x_%A_%a.log.err run_select_features_bootstrap_array.sh
+# UNIVARIATE_METHOD=single_feature_performance SKIP_CORRELATED_SELECTION=true sbatch --array=0-99 -J select_features_bootstrap_sfp_auc_nocorr -p short,long --mem=200G --output=logs/select_features/progb_vs_nonprogb_singlefeatureperformance_auc_no_correlated_selection/%x_%A_%a.log.out --error=logs/select_features/progb_vs_nonprogb_singlefeatureperformance_auc_no_correlated_selection/%x_%A_%a.log.err run_select_features_bootstrap_array.sh
 
 if [[ -z "${SLURM_ARRAY_TASK_ID:-}" ]]; then
     echo "SLURM_ARRAY_TASK_ID is not set. Submit with sbatch --array=0-99." >&2
