@@ -3,7 +3,7 @@
 
 # sbatch -J tune_models_progb_vs_nonprogb_selectkbest_p005_top5 -p long --mem=100G --cpus-per-task=11 --output=logs/%x.log.out --error=logs/%x.log.err --wrap="python tune_models.py --n-jobs 10 --mlflow-experiment-name progb_vs_nonprogb_selectkbest_p005_top5 --train-path /well/immune-rep/users/yfg436/git/ml-tabular/results/select_features/progb_vs_nonprogb_selectkbest_p005/train.csv --test-path /well/immune-rep/users/yfg436/git/ml-tabular/results/select_features/progb_vs_nonprogb_selectkbest_p005/test.csv --target-column is_progb"
 
-# sbatch -J tune_models_progb_vs_nonprogb_selectkbest_p005_nocorr_smartcorr_c09 -p long --mem=100G --cpus-per-task=11 --output=logs/%x.log.out --error=logs/%x.log.err --wrap="python tune_models.py --n-jobs 10 --mlflow-experiment-name progb_vs_nonprogb_selectkbest_p005_no_correlated_selection_smartcorrelation_c09 --train-path /well/immune-rep/users/yfg436/git/ml-tabular/results/select_features/progb_vs_nonprogb_selectkbest_p005_no_correlated_selection_smartcorrelation_c09/train.csv --test-path /well/immune-rep/users/yfg436/git/ml-tabular/results/select_features/progb_vs_nonprogb_selectkbest_p005_no_correlated_selection_smartcorrelation_c09/test.csv --target-column is_progb"
+# sbatch -J tune_models_progb_vs_nonprogb_selectkbest_p005_nocorr_smartcorr_c09 -p long --mem=300G --cpus-per-task=30 --output=logs/%x.log.out --error=logs/%x.log.err --wrap="python tune_models.py --n-jobs 50 --optuna-n-trials 500 --mlflow-experiment-name progb_vs_nonprogb_selectkbest_p005_no_correlated_selection_smartcorrelation_c09 --train-path /well/immune-rep/users/yfg436/git/ml-tabular/results/select_features/progb_vs_nonprogb_selectkbest_p005_no_correlated_selection_smartcorrelation_c09/train.csv --test-path /well/immune-rep/users/yfg436/git/ml-tabular/results/select_features/progb_vs_nonprogb_selectkbest_p005_no_correlated_selection_smartcorrelation_c09/test.csv --target-column is_progb"
 
 # sbatch -J tune_models_progb_vs_nonprogb_selectkbest_p005_nocorr_summary -p long --mem=100G --cpus-per-task=11 --output=logs/%x.log.out --error=logs/%x.log.err --wrap="python tune_models.py --n-jobs 10 --mlflow-experiment-name progb_vs_nonprogb_selectkbest_p005_no_correlated_selection --train-path /well/immune-rep/users/yfg436/git/ml-tabular/results/summarise_bootstrap_features/progb_vs_nonprogb_selectkbest_p005_no_correlated_selection/train.csv --test-path /well/immune-rep/users/yfg436/git/ml-tabular/results/summarise_bootstrap_features/progb_vs_nonprogb_selectkbest_p005_no_correlated_selection/test.csv --target-column is_progb"
 
@@ -50,10 +50,8 @@ top_models_to_tune = [
     "LogisticRegression"
 ]
 
-random_state = 123
 test_size = 0.2
 cv_folds = 5
-optuna_n_trials = 30
 scoring_metric = "roc_auc" #"roc_auc_ovr"
 
 parser = argparse.ArgumentParser()
@@ -63,6 +61,12 @@ parser.add_argument(
     type=int,
     default=1,
     help="Number of Optuna trials to run in parallel within each model family.",
+)
+parser.add_argument(
+    "--optuna-n-trials",
+    type=int,
+    default=50,
+    help="Number of Optuna trials to run per model family.",
 )
 parser.add_argument(
     "--mlflow-experiment-name",
@@ -87,6 +91,12 @@ parser.add_argument(
     help="Target column name in train and test CSVs.",
 )
 parser.add_argument(
+    "--random-state",
+    type=int,
+    default=123,
+    help="Random seed used for CV splitting, model seeds, Optuna, and bootstrap CIs.",
+)
+parser.add_argument(
     "--ci-bootstrap-n",
     type=int,
     default=200,
@@ -100,9 +110,18 @@ parser.add_argument(
 )
 args = parser.parse_args()
 
+optuna_n_trials = args.optuna_n_trials
+if optuna_n_trials < 1:
+    raise ValueError("optuna_n_trials must be at least 1")
+random_state = args.random_state
 n_jobs = args.n_jobs
 if n_jobs < 1:
     raise ValueError("n_jobs must be at least 1")
+if n_jobs > 1:
+    print(
+        "WARNING: Parallel Optuna can be nondeterministic; use --n-jobs 1 "
+        "for strict reproducibility."
+    )
 ci_bootstrap_n = args.ci_bootstrap_n
 if ci_bootstrap_n < 1:
     raise ValueError("ci_bootstrap_n must be at least 1")
@@ -298,6 +317,7 @@ def build_pipeline(trial, model_name, fit_label=None):
             eval_metric="logloss",
             n_jobs=1,
             random_state=random_state,
+            seed=random_state,
         )
         return Pipeline([("preprocessor", preprocessor), ("model", model)])
 
@@ -351,6 +371,8 @@ def build_pipeline(trial, model_name, fit_label=None):
             reg_lambda=trial.suggest_float("reg_lambda", 1e-8, 10.0, log=True),
             n_jobs=1,
             random_state=random_state,
+            deterministic=True,
+            force_col_wise=True,
             verbose=-1,
         )
         return Pipeline([("preprocessor", preprocessor), ("model", model)])
@@ -642,7 +664,7 @@ def save_best_param_cv_fold_models(
     return cv_fold_model_summary_df, cv_fold_assignments_df
 
 
-def plot_model_comparison(results_df, scoring_metric, out_path):
+def plot_model_comparison(results_df, scoring_metric, best_model_name, out_path):
     plot_df = results_df.copy()
     score_columns = [
         ("best_score", "selection_cv", "#4C78A8"),
@@ -650,7 +672,7 @@ def plot_model_comparison(results_df, scoring_metric, out_path):
         ("calibrated_test_score", "calibrated_test", "#54A24B"),
     ]
 
-    fig, ax = plt.subplots(figsize=(8, 5))
+    fig, ax = plt.subplots(figsize=(8, 5.8))
     x_positions = np.arange(len(plot_df))
     bar_width = 0.25
 
@@ -675,28 +697,26 @@ def plot_model_comparison(results_df, scoring_metric, out_path):
     ax.set_xticklabels(plot_df["model_name"], rotation=45, ha="right")
     ax.set_xlabel("Model family")
     ax.set_ylabel(f"Score: {scoring_metric}")
-    ax.set_title("Model comparison: CV selection vs held-out test")
+    ax.set_title(
+        "Model comparison: CV selection vs held-out test; "
+        f"final selected: {best_model_name}"
+    )
     ax.legend()
 
-    best_idx = plot_df["best_score"].idxmax()
-    best_name = plot_df.loc[best_idx, "model_name"]
-    best_score_value = plot_df.loc[best_idx, "best_score"]
+    best_score_value = plot_df.iloc[0]["best_score"]
     ax.axhline(best_score_value, color="darkorange", linestyle="--", linewidth=1)
-    ax.text(
-        0.02,
-        0.98,
-        f"Selected model: {best_name}",
-        transform=ax.transAxes,
-        ha="left",
-        va="top",
-    )
 
     fig.tight_layout()
     fig.savefig(out_path, dpi=300)
     plt.close(fig)
 
 
-def plot_model_comparison_confidence(confidence_df, scoring_metric, out_path):
+def plot_model_comparison_confidence(
+    confidence_df,
+    scoring_metric,
+    best_model_name,
+    out_path,
+):
     plot_df = confidence_df[
         confidence_df["score_source"].isin(
             ["selection_cv", "uncalibrated_test", "calibrated_test"]
@@ -709,7 +729,7 @@ def plot_model_comparison_confidence(confidence_df, scoring_metric, out_path):
     ]
     model_names = list(plot_df["model_name"].drop_duplicates())
 
-    fig, ax = plt.subplots(figsize=(8, 5))
+    fig, ax = plt.subplots(figsize=(8, 5.8))
     x_positions = np.arange(len(model_names))
     bar_width = 0.25
 
@@ -758,7 +778,10 @@ def plot_model_comparison_confidence(confidence_df, scoring_metric, out_path):
     ax.set_xticklabels(model_names, rotation=45, ha="right")
     ax.set_xlabel("Model family")
     ax.set_ylabel(f"Score: {scoring_metric}")
-    ax.set_title("Model comparison with confidence intervals")
+    ax.set_title(
+        "Model comparison with confidence intervals; "
+        f"final selected: {best_model_name}"
+    )
     ax.legend()
 
     fig.tight_layout()
@@ -1056,6 +1079,8 @@ for lazy_name in top_models_to_tune:
         continue
 
     model_name = MODEL_NAME_MAP[lazy_name]
+    optuna_sampler_name = "TPESampler"
+    optuna_study_name = f"{mlflow_experiment_name}__{model_name}"
 
     with mlflow.start_run(run_name=f"optuna_{model_name}"):
         log_data_source_params()
@@ -1065,9 +1090,19 @@ for lazy_name in top_models_to_tune:
         mlflow.log_param("scoring", scoring_metric)
         mlflow.log_param("optuna_n_trials", optuna_n_trials)
         mlflow.log_param("n_jobs", n_jobs)
+        mlflow.log_param("random_state", random_state)
+        mlflow.log_param("optuna_sampler", optuna_sampler_name)
+        mlflow.log_param("optuna_seed", random_state)
+        mlflow.log_param("optuna_study_name", optuna_study_name)
+        mlflow.log_param("strict_reproducibility", n_jobs == 1)
         mlflow.log_param("test_size", test_size)
 
-        study = optuna.create_study(direction="maximize")
+        sampler = optuna.samplers.TPESampler(seed=random_state)
+        study = optuna.create_study(
+            direction="maximize",
+            sampler=sampler,
+            study_name=optuna_study_name,
+        )
         study.optimize(
             make_objective(model_name),
             n_trials=optuna_n_trials,
@@ -1086,22 +1121,24 @@ for lazy_name in top_models_to_tune:
                 "best_score": study.best_value,
                 "best_params": study.best_params,
                 "cv_scores": study.best_trial.user_attrs["cv_scores"],
+                "optuna_study_name": optuna_study_name,
             }
         )
 
 results_df = pd.DataFrame(results).sort_values("best_score", ascending=False)
-best_model_name = results_df.iloc[0]["model_name"]
 num_classes = len(np.unique(y_train))
 
 bin_edges = np.linspace(0.0, 1.0, 11)
 confidence_thresholds = [0.50, 0.60, 0.70, 0.80, 0.90, 0.95]
 model_metric_rows = []
 model_score_ci_rows = []
+model_run_ids = {}
 
 for _, model_row in results_df.iterrows():
     lazy_name = model_row["lazy_name"]
     model_name = model_row["model_name"]
     best_params = model_row["best_params"]
+    optuna_study_name = model_row["optuna_study_name"]
     selection_cv_score = float(model_row["best_score"])
 
     uncalibrated_model_path = os.path.join(
@@ -1352,17 +1389,22 @@ for _, model_row in results_df.iterrows():
         }
     )
 
-    with mlflow.start_run(run_name=f"model_{model_name}"):
+    with mlflow.start_run(run_name=f"model_{model_name}") as model_run:
+        model_run_ids[model_name] = model_run.info.run_id
         log_data_source_params()
         mlflow.log_param("model_family", model_name)
         mlflow.log_param("lazy_name", lazy_name)
-        mlflow.log_param("selected_by_cv", model_name == best_model_name)
         mlflow.log_param("cv_folds", cv.get_n_splits())
         mlflow.log_param("scoring_metric", scoring_metric)
         mlflow.log_param("calibration_method", "sigmoid")
         mlflow.log_param("calibration_cv_folds", cv.get_n_splits())
         mlflow.log_param("calibration_ensemble", False)
         mlflow.log_param("n_jobs", n_jobs)
+        mlflow.log_param("random_state", random_state)
+        mlflow.log_param("optuna_sampler", "TPESampler")
+        mlflow.log_param("optuna_seed", random_state)
+        mlflow.log_param("optuna_study_name", optuna_study_name)
+        mlflow.log_param("strict_reproducibility", n_jobs == 1)
         mlflow.log_param("ci_bootstrap_n", ci_bootstrap_n)
         mlflow.log_param("ci_alpha", ci_alpha)
         for key, value in best_params.items():
@@ -1437,8 +1479,24 @@ results_df = results_df.merge(
     model_metrics_df,
     on=["lazy_name", "model_name"],
     how="left",
-).sort_values("best_score", ascending=False)
+).sort_values(
+    ["best_score", "uncalibrated_test_score", "calibrated_test_score"],
+    ascending=False,
+    kind="mergesort",
+)
+best_model_name = results_df.iloc[0]["model_name"]
+results_df["final_selected_model"] = results_df["model_name"] == best_model_name
 results_df.to_csv(optuna_comparison_path, index=False)
+
+for _, model_row in results_df.iterrows():
+    model_run_id = model_run_ids.get(model_row["model_name"])
+    if model_run_id is None:
+        continue
+    with mlflow.start_run(run_id=model_run_id):
+        mlflow.log_param(
+            "final_selected_model",
+            bool(model_row["final_selected_model"]),
+        )
 
 model_score_ci_df = pd.DataFrame(model_score_ci_rows)
 model_order = {
@@ -1462,12 +1520,14 @@ model_score_ci_df.to_csv(model_score_confidence_intervals_path, index=False)
 plot_model_comparison(
     results_df=results_df,
     scoring_metric=scoring_metric,
+    best_model_name=best_model_name,
     out_path=plot_model_comparison_path,
 )
 
 plot_model_comparison_confidence(
     confidence_df=model_score_ci_df,
     scoring_metric=scoring_metric,
+    best_model_name=best_model_name,
     out_path=plot_model_comparison_confidence_path,
 )
 
