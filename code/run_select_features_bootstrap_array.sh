@@ -1,19 +1,21 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# cd /well/immune-rep/users/yfg436/git/ml-tabular/code
+# mkdir -p logs/select_features/prog_stage_selectkbest_p005_no_correlated_selection
+# SKIP_CORRELATED_SELECTION=true MIN_NON_MISSING_PER_CLASS=3 sbatch --array=0-99 -J select_features_prog_stage_p005_nocorr -p short,long --mem=200G --output=logs/select_features/prog_stage_selectkbest_p005_no_correlated_selection/%x_%A_%a.log.out --error=logs/select_features/prog_stage_selectkbest_p005_no_correlated_selection/%x_%A_%a.log.err run_select_features_bootstrap_array.sh
+
 # mkdir -p logs/select_features/progb_vs_nonprogb_selectkbest_p005
 # sbatch --array=0-99 -J select_features_bootstrap_p005 -p short,long --mem=200G --output=logs/select_features/progb_vs_nonprogb_selectkbest_p005/%x_%A_%a.log.out --error=logs/select_features/progb_vs_nonprogb_selectkbest_p005/%x_%A_%a.log.err run_select_features_bootstrap_array.sh
 
-# cd /well/immune-rep/users/yfg436/git/ml-tabular/code
 # mkdir -p logs/select_features/progb_vs_nonprogb_selectkbest_p005_no_correlated_selection
 # SKIP_CORRELATED_SELECTION=true sbatch --array=0-99 -J select_features_bootstrap_p005_nocorr -p short,long --mem=200G --output=logs/select_features/progb_vs_nonprogb_selectkbest_p005_no_correlated_selection/%x_%A_%a.log.out --error=logs/select_features/progb_vs_nonprogb_selectkbest_p005_no_correlated_selection/%x_%A_%a.log.err run_select_features_bootstrap_array.sh
 
-# cd /well/immune-rep/users/yfg436/git/ml-tabular/code
 # mkdir -p logs/select_features/progb_vs_nonprogb_singlefeatureperformance_auc
 # UNIVARIATE_METHOD=single_feature_performance sbatch --array=0-99 -J select_features_bootstrap_sfp_auc -p short,long --mem=200G --output=logs/select_features/progb_vs_nonprogb_singlefeatureperformance_auc/%x_%A_%a.log.out --error=logs/select_features/progb_vs_nonprogb_singlefeatureperformance_auc/%x_%A_%a.log.err run_select_features_bootstrap_array.sh
 
-# cd /well/immune-rep/users/yfg436/git/ml-tabular/code
+# mkdir -p logs/select_features/progb_vs_nonprogb_singlefeatureperformance_auc_no_correlated_selection
+# UNIVARIATE_METHOD=single_feature_performance SKIP_CORRELATED_SELECTION=true sbatch --array=0-99 -J select_features_bootstrap_sfp_auc_nocorr -p short,long --mem=200G --output=logs/select_features/progb_vs_nonprogb_singlefeatureperformance_auc_no_correlated_selection/%x_%A_%a.log.out --error=logs/select_features/progb_vs_nonprogb_singlefeatureperformance_auc_no_correlated_selection/%x_%A_%a.log.err run_select_features_bootstrap_array.sh
+
 # mkdir -p logs/select_features/progb_vs_nonprogb_singlefeatureperformance_auc_no_correlated_selection
 # UNIVARIATE_METHOD=single_feature_performance SKIP_CORRELATED_SELECTION=true sbatch --array=0-99 -J select_features_bootstrap_sfp_auc_nocorr -p short,long --mem=200G --output=logs/select_features/progb_vs_nonprogb_singlefeatureperformance_auc_no_correlated_selection/%x_%A_%a.log.out --error=logs/select_features/progb_vs_nonprogb_singlefeatureperformance_auc_no_correlated_selection/%x_%A_%a.log.err run_select_features_bootstrap_array.sh
 
@@ -26,9 +28,15 @@ SCRIPT_DIR="/well/immune-rep/users/yfg436/git/ml-tabular/code"
 REPO_ROOT="/well/immune-rep/users/yfg436/git/ml-tabular"
 cd "${SCRIPT_DIR}"
 
-SKIP_CORRELATED_SELECTION="${SKIP_CORRELATED_SELECTION:-false}"
+SKIP_CORRELATED_SELECTION="${SKIP_CORRELATED_SELECTION:-true}"
 if [[ "${SKIP_CORRELATED_SELECTION}" != "true" && "${SKIP_CORRELATED_SELECTION}" != "false" ]]; then
     echo "SKIP_CORRELATED_SELECTION must be true or false." >&2
+    exit 1
+fi
+
+MIN_NON_MISSING_PER_CLASS="${MIN_NON_MISSING_PER_CLASS:-3}"
+if ! [[ "${MIN_NON_MISSING_PER_CLASS}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "MIN_NON_MISSING_PER_CLASS must be a positive integer." >&2
     exit 1
 fi
 
@@ -67,9 +75,22 @@ LOG_DIR="${SCRIPT_DIR}/logs/select_features/${RUN_ID}"
 BOOTSTRAP_ID="${SLURM_ARRAY_TASK_ID}"
 BOOTSTRAP_SEED="${SLURM_ARRAY_TASK_ID}"
 
-TRAIN_PATH="/well/immune-rep/users/yfg436/git/sle/results/prediction/create_input_table/group_id_nonprogb_progb_missingness0_minuniqueNone/train.csv"
-TEST_PATH="/well/immune-rep/users/yfg436/git/sle/results/prediction/create_input_table/group_id_nonprogb_progb_missingness0_minuniqueNone/test.csv"
+# Previous binary preset:
+# TRAIN_PATH="/well/immune-rep/users/yfg436/git/sle/results/prediction/create_input_table/group_id_nonprogb_progb_missingness0_minuniqueNone/train.csv"
+# TEST_PATH="/well/immune-rep/users/yfg436/git/sle/results/prediction/create_input_table/group_id_nonprogb_progb_missingness0_minuniqueNone/test.csv"
+# TARGET_COLUMN="is_progb"
+TRAIN_PATH="${TRAIN_PATH:-/well/immune-rep/users/yfg436/git/sle/results/prediction/create_input_table/prog_stage/group_id_healthy_progb_progf_missingness0_minuniqueNone/train.csv}"
+TEST_PATH="${TEST_PATH:-}"
+TARGET_COLUMN="${TARGET_COLUMN:-prog_stage}"
 OUT_DIR="${REPO_ROOT}/results/select_features/${RUN_ID}/bootstraps/bootstrap_${BOOTSTRAP_ID}"
+PYTHON_INPUT_ARGS=(
+    --train-path "${TRAIN_PATH}"
+    --target-column "${TARGET_COLUMN}"
+    --min-non-missing-per-class "${MIN_NON_MISSING_PER_CLASS}"
+)
+if [[ -n "${TEST_PATH}" ]]; then
+    PYTHON_INPUT_ARGS+=(--test-path "${TEST_PATH}")
+fi
 
 mkdir -p "${LOG_DIR}"
 mkdir -p "${OUT_DIR}"
@@ -79,14 +100,16 @@ echo "Bootstrap ID: ${BOOTSTRAP_ID}"
 echo "Bootstrap seed: ${BOOTSTRAP_SEED}"
 echo "Univariate method: ${UNIVARIATE_METHOD}"
 echo "Skip correlated selection: ${SKIP_CORRELATED_SELECTION}"
+echo "Min non-missing per class: ${MIN_NON_MISSING_PER_CLASS}"
+echo "Train path: ${TRAIN_PATH}"
+echo "Test path: ${TEST_PATH:-<none>}"
+echo "Target column: ${TARGET_COLUMN}"
 echo "Log directory: ${LOG_DIR}"
 echo "Output directory: ${OUT_DIR}"
 
 python select_features.py \
     --out-dir "${OUT_DIR}" \
-    --train-path "${TRAIN_PATH}" \
-    --test-path "${TEST_PATH}" \
-    --target-column is_progb \
+    "${PYTHON_INPUT_ARGS[@]}" \
     "${UNIVARIATE_SELECTION_ARGS[@]}" \
     --bootstrap-train \
     --bootstrap-seed "${BOOTSTRAP_SEED}" \
