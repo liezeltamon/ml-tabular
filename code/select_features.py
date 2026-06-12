@@ -8,9 +8,11 @@
 import argparse
 import os
 import subprocess
+import warnings
 
 import numpy as np
 import pandas as pd
+from scipy import stats
 
 from sklearn.feature_selection import SelectKBest, f_classif
 
@@ -34,7 +36,7 @@ os.chdir(
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--train-path", default="data/train.csv")
-parser.add_argument("--test-path", default="data/test.csv")
+parser.add_argument("--test-path", default=None)
 parser.add_argument("--target-column", default="is_progb")
 parser.add_argument("--out-dir", default="results/select_features")
 parser.add_argument("--correlation-threshold", type=float, default=0.8)
@@ -47,6 +49,12 @@ parser.add_argument(
     default="select_k_best",
 )
 parser.add_argument("--univariate-pvalue-threshold", type=float, default=0.05)
+parser.add_argument(
+    "--min-non-missing-per-class",
+    type=int,
+    default=None,
+    help="Drop features with fewer than this many non-missing train samples in any target class before feature selection.",
+)
 parser.add_argument("--univariate-scoring", default="roc_auc")
 parser.add_argument("--univariate-cv", type=int, default=5)
 parser.add_argument("--univariate-threshold", type=float, default=None)
@@ -55,7 +63,7 @@ parser.add_argument("--skip-correlated-selection", action="store_true")
 parser.add_argument(
     "--write-reduced-data",
     action="store_true",
-    help="Write train.csv and test.csv reduced to selected features.",
+    help="Write train.csv, and test.csv when --test-path is provided, reduced to selected features.",
 )
 parser.add_argument(
     "--bootstrap-train",
@@ -84,21 +92,22 @@ def assert_valid_input(train_df, test_df, target_column):
     assert target_column in train_df.columns, (
         f"{target_column} not found in train columns"
     )
-    assert target_column in test_df.columns, (
-        f"{target_column} not found in test columns"
-    )
 
     train_features = train_df.drop(columns=[target_column]).columns
-    test_features = test_df.drop(columns=[target_column]).columns
-    assert train_features.equals(test_features), (
-        "Train and test feature columns differ before feature selection"
-    )
-
     non_numeric = train_df[train_features].select_dtypes(exclude="number").columns
     assert len(non_numeric) == 0, (
         "Feature selection expects numeric features. "
         f"Non-numeric columns found: {non_numeric.tolist()}"
     )
+
+    if test_df is not None:
+        assert target_column in test_df.columns, (
+            f"{target_column} not found in test columns"
+        )
+        test_features = test_df.drop(columns=[target_column]).columns
+        assert train_features.equals(test_features), (
+            "Train and test feature columns differ before feature selection"
+        )
 
 
 def bootstrap_train_df(train_df, target_column, seed, stratified):
@@ -114,6 +123,70 @@ def bootstrap_train_df(train_df, target_column, seed, stratified):
         sampled_parts.append(group.iloc[sampled_positions])
 
     return pd.concat(sampled_parts, axis=0).sample(frac=1, random_state=seed).copy()
+
+
+def filter_features_by_min_non_missing_per_class(
+    X_train,
+    y_train,
+    min_non_missing_per_class,
+):
+    non_missing_counts = (
+        X_train.notna()
+        .reset_index(drop=True)
+        .groupby(pd.Series(y_train).reset_index(drop=True), sort=False)
+        .sum()
+    )
+    min_counts = non_missing_counts.min(axis=0)
+    dropped = min_counts[min_counts < min_non_missing_per_class]
+    dropped_features_df = pd.DataFrame(
+        {
+            "feature": dropped.index,
+            "min_non_missing_per_class": dropped.values,
+            "threshold": min_non_missing_per_class,
+        }
+    )
+
+    X_train_filtered = X_train.loc[:, min_counts >= min_non_missing_per_class]
+    if X_train_filtered.shape[1] == 0:
+        raise ValueError(
+            "No features remain after --min-non-missing-per-class="
+            f"{min_non_missing_per_class}"
+        )
+
+    return X_train_filtered, dropped_features_df
+
+
+def missingness_aware_f_classif(X, y):
+    X_df = pd.DataFrame(X).reset_index(drop=True)
+    y_series = pd.Series(y).reset_index(drop=True)
+    classes = pd.unique(y_series)
+    scores = np.full(X_df.shape[1], np.nan, dtype=float)
+    pvalues = np.full(X_df.shape[1], np.nan, dtype=float)
+
+    for col_idx, column in enumerate(X_df.columns):
+        values = X_df[column]
+        groups = []
+        valid_feature = True
+        for class_value in classes:
+            group_values = values[(y_series == class_value) & values.notna()].to_numpy(
+                dtype=float
+            )
+            if len(group_values) < 2:
+                valid_feature = False
+                break
+            groups.append(group_values)
+
+        if not valid_feature:
+            continue
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            score, pvalue = stats.f_oneway(*groups)
+        if np.isfinite(score) and np.isfinite(pvalue):
+            scores[col_idx] = score
+            pvalues[col_idx] = pvalue
+
+    return scores, pvalues
 
 
 def scale_for_selection(X_train):
@@ -207,7 +280,7 @@ def run_feature_selection(X_train, y_train, args):
         X_train_selection = X_train.copy()
 
     X_train_selection, constant_selector = fit_transform_train_selector(
-        DropConstantFeatures(missing_values="raise"),
+        DropConstantFeatures(missing_values="ignore"),
         X_train_selection,
         "drop_constant",
         summary_rows,
@@ -215,7 +288,7 @@ def run_feature_selection(X_train, y_train, args):
     )
 
     X_train_selection, duplicate_selector = fit_transform_train_selector(
-        DropDuplicateFeatures(missing_values="raise"),
+        DropDuplicateFeatures(missing_values="ignore"),
         X_train_selection,
         "drop_duplicate",
         summary_rows,
@@ -228,8 +301,26 @@ def run_feature_selection(X_train, y_train, args):
     if not args.skip_univariate_selection:
         if args.univariate_method == "select_k_best":
             n_features_before = X_train_selection.shape[1]
-            univariate_selector = SelectKBest(score_func=f_classif, k="all")
-            univariate_selector.fit(X_train_selection, y_train)
+            has_missing_for_select_k_best = X_train_selection.isna().any().any()
+            if has_missing_for_select_k_best:
+                print(
+                    "Training features contain missing values; using "
+                    "missingness-aware ANOVA scorer for SelectKBest."
+                )
+                X_train_selection_for_score = X_train_selection.copy()
+
+                def score_func(X, y):
+                    return missingness_aware_f_classif(X_train_selection_for_score, y)
+
+                univariate_method = "select_k_best_missingness_aware"
+                X_train_fit = X_train_selection.fillna(0)
+            else:
+                score_func = f_classif
+                univariate_method = "select_k_best"
+                X_train_fit = X_train_selection
+
+            univariate_selector = SelectKBest(score_func=score_func, k="all")
+            univariate_selector.fit(X_train_fit, y_train)
 
             scores = pd.Series(
                 univariate_selector.scores_,
@@ -242,7 +333,7 @@ def run_feature_selection(X_train, y_train, args):
                 name="pvalue",
             )
             selected_features_univariate = pvalues[
-                pvalues < args.univariate_pvalue_threshold
+                pvalues.notna() & (pvalues < args.univariate_pvalue_threshold)
             ].index.tolist()
             if len(selected_features_univariate) == 0:
                 raise ValueError(
@@ -260,6 +351,12 @@ def run_feature_selection(X_train, y_train, args):
                 for feature in features_to_drop
             )
             X_train_selection = X_train_selection[selected_features_univariate]
+            if has_missing_for_select_k_best and X_train_selection.isna().any().any():
+                print(
+                    "Warning: selected features still contain missing values after "
+                    "SelectKBest; smart correlation may fail unless it is skipped "
+                    "or missingness is handled first."
+                )
             n_features_after = X_train_selection.shape[1]
             summary_rows.append(
                 {
@@ -276,7 +373,7 @@ def run_feature_selection(X_train, y_train, args):
                     "pvalue": pvalues.values,
                     "score_std": pd.NA,
                     "selected": scores.index.isin(selected_features_univariate),
-                    "method": "select_k_best",
+                    "method": univariate_method,
                 }
             )
         else:
@@ -359,13 +456,24 @@ def run_feature_selection(X_train, y_train, args):
 
 # %% ----- MAIN -----
 
+if args.test_path == "":
+    args.test_path = None
+if (
+    args.min_non_missing_per_class is not None
+    and args.min_non_missing_per_class < 1
+):
+    raise ValueError("--min-non-missing-per-class must be >= 1")
 os.makedirs(args.out_dir, exist_ok=True)
 
 
 # %% Load data
 
 train_df = pd.read_csv(args.train_path, index_col=0)
-test_df = pd.read_csv(args.test_path, index_col=0)
+test_df = (
+    pd.read_csv(args.test_path, index_col=0)
+    if args.test_path is not None
+    else None
+)
 
 assert_valid_input(train_df, test_df, args.target_column)
 
@@ -381,6 +489,27 @@ else:
 
 X_train = train_df_selection.drop(columns=[args.target_column])
 y_train = train_df_selection[args.target_column]
+
+if args.min_non_missing_per_class is not None:
+    X_train, dropped_min_non_missing_df = (
+        filter_features_by_min_non_missing_per_class(
+            X_train,
+            y_train,
+            args.min_non_missing_per_class,
+        )
+    )
+    dropped_min_non_missing_df.to_csv(
+        os.path.join(
+            args.out_dir,
+            "features_dropped_min_non_missing_per_class.csv",
+        ),
+        index=False,
+    )
+    print(
+        "Dropped "
+        f"{len(dropped_min_non_missing_df)} features with fewer than "
+        f"{args.min_non_missing_per_class} non-missing samples in any class."
+    )
 
 
 # %% Select features on train only
@@ -427,13 +556,17 @@ if args.write_reduced_data:
     selected_features = selection_outputs["selected_features"]
     output_columns = selected_features + [args.target_column]
     original_train_features = train_df.drop(columns=[args.target_column]).columns
-    original_test_features = test_df.drop(columns=[args.target_column]).columns
     missing_train_features = sorted(
         set(selected_features).difference(original_train_features)
     )
-    missing_test_features = sorted(
-        set(selected_features).difference(original_test_features)
-    )
+
+    if test_df is not None:
+        original_test_features = test_df.drop(columns=[args.target_column]).columns
+        missing_test_features = sorted(
+            set(selected_features).difference(original_test_features)
+        )
+    else:
+        missing_test_features = []
 
     if missing_train_features or missing_test_features:
         missing_train_preview = ", ".join(missing_train_features[:10])
@@ -447,10 +580,13 @@ if args.write_reduced_data:
     train_df.loc[:, output_columns].to_csv(
         os.path.join(args.out_dir, "train.csv"),
     )
-    test_df.loc[:, output_columns].to_csv(
-        os.path.join(args.out_dir, "test.csv"),
-    )
-    print(f"Saved reduced train/test data to {args.out_dir}")
+    if test_df is not None:
+        test_df.loc[:, output_columns].to_csv(
+            os.path.join(args.out_dir, "test.csv"),
+        )
+        print(f"Saved reduced train/test data to {args.out_dir}")
+    else:
+        print(f"Saved reduced train data to {args.out_dir}")
 
 print(summary_df)
 print(f"Selected features: {len(selection_outputs['selected_features'])}")
