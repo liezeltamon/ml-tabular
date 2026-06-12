@@ -2,6 +2,19 @@
 # env: ml-tabular-env
 
 # cd /well/immune-rep/users/yfg436/git/ml-tabular/code
+# mkdir -p logs/summarise_bootstrap_features/prog_stage_selectkbest_p005_no_correlated_selection
+# sbatch -J summarise_prog_stage_p005_nocorr -p short,long --mem=15G \
+#   --output=logs/summarise_bootstrap_features/prog_stage_selectkbest_p005_no_correlated_selection/%x.log.out \
+#   --error=logs/summarise_bootstrap_features/prog_stage_selectkbest_p005_no_correlated_selection/%x.log.err \
+#   --wrap="python summarise_bootstrap_features.py \
+#     --bootstrap-root /well/immune-rep/users/yfg436/git/ml-tabular/results/select_features/prog_stage_selectkbest_p005_no_correlated_selection/bootstraps \
+#     --train-path /well/immune-rep/users/yfg436/git/sle/results/prediction/create_input_table/prog_stage/group_id_healthy_progb_progf_missingness0_minuniqueNone/train.csv \
+#     --target-column prog_stage \
+#     --out-dir /well/immune-rep/users/yfg436/git/ml-tabular/results/summarise_bootstrap_features/prog_stage_selectkbest_p005_no_correlated_selection \
+#     --selection-threshold 0.9 \
+#     --no-correlation-outputs"
+
+# cd /well/immune-rep/users/yfg436/git/ml-tabular/code
 # mkdir -p logs/summarise_bootstrap_features/progb_vs_nonprogb_selectkbest_p005
 # sbatch -J summarise_bootstrap_p005 -p short,long --mem=15G \
 #   --output=logs/summarise_bootstrap_features/progb_vs_nonprogb_selectkbest_p005/%x.log.out \
@@ -136,13 +149,14 @@ def missing_required_outputs(bootstrap_dir, no_correlation_outputs):
 def assert_valid_original_data(train_df, test_df, target_column):
     if target_column not in train_df.columns:
         raise ValueError(f"{target_column} not found in train columns")
-    if target_column not in test_df.columns:
-        raise ValueError(f"{target_column} not found in test columns")
 
     train_features = train_df.drop(columns=[target_column]).columns
-    test_features = test_df.drop(columns=[target_column]).columns
-    if not train_features.equals(test_features):
-        raise ValueError("Train and test feature columns differ")
+    if test_df is not None:
+        if target_column not in test_df.columns:
+            raise ValueError(f"{target_column} not found in test columns")
+        test_features = test_df.drop(columns=[target_column]).columns
+        if not train_features.equals(test_features):
+            raise ValueError("Train and test feature columns differ")
 
 
 def reduce_and_save_data(train_df, test_df, selected_features, target_column, out_dir):
@@ -156,10 +170,11 @@ def reduce_and_save_data(train_df, test_df, selected_features, target_column, ou
         raise ValueError(
             "Selected bootstrap features are missing from input data: "
             f"{missing_preview}"
-        )
+    )
 
     train_df.loc[:, output_columns].to_csv(out_dir / "train.csv")
-    test_df.loc[:, output_columns].to_csv(out_dir / "test.csv")
+    if test_df is not None:
+        test_df.loc[:, output_columns].to_csv(out_dir / "test.csv")
 
 
 def save_feature_frequency_histogram(feature_frequency_df, selection_threshold, output_path):
@@ -248,7 +263,7 @@ parser = argparse.ArgumentParser(
 )
 parser.add_argument("--bootstrap-root", required=True)
 parser.add_argument("--train-path", required=True)
-parser.add_argument("--test-path", required=True)
+parser.add_argument("--test-path", default=None)
 parser.add_argument("--target-column", default="is_progb")
 parser.add_argument("--out-dir", required=True)
 parser.add_argument("--selection-threshold", type=float, default=0.9)
@@ -263,6 +278,8 @@ parser.add_argument(
 )
 args = parser.parse_args()
 
+if args.test_path == "":
+    args.test_path = None
 if not 0 < args.selection_threshold <= 1:
     raise ValueError("--selection-threshold must be in the interval (0, 1].")
 
@@ -442,7 +459,11 @@ pd.DataFrame({"feature": selected_final_features}).to_csv(
 )
 
 train_df = pd.read_csv(args.train_path, index_col=0)
-test_df = pd.read_csv(args.test_path, index_col=0)
+test_df = (
+    pd.read_csv(args.test_path, index_col=0)
+    if args.test_path is not None
+    else None
+)
 assert_valid_original_data(train_df, test_df, args.target_column)
 reduce_and_save_data(
     train_df,
