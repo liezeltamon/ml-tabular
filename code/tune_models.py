@@ -3,7 +3,7 @@
 
 # sbatch -J tune_models_progb_vs_nonprogb_selectkbest_p005_top5 -p long --mem=100G --cpus-per-task=11 --output=logs/%x.log.out --error=logs/%x.log.err --wrap="python tune_models.py --n-jobs 10 --mlflow-experiment-name progb_vs_nonprogb_selectkbest_p005_top5 --train-path /well/immune-rep/users/yfg436/git/ml-tabular/results/select_features/progb_vs_nonprogb_selectkbest_p005/train.csv --test-path /well/immune-rep/users/yfg436/git/ml-tabular/results/select_features/progb_vs_nonprogb_selectkbest_p005/test.csv --target-column is_progb"
 
-# sbatch -J tune_models_progb_vs_nonprogb_selectkbest_p005_nocorr_smartcorr_c09 -p long --mem=300G --cpus-per-task=30 --output=logs/%x.log.out --error=logs/%x.log.err --wrap="python tune_models.py --n-jobs 50 --optuna-n-trials 500 --mlflow-experiment-name progb_vs_nonprogb_selectkbest_p005_no_correlated_selection_smartcorrelation_c09 --train-path /well/immune-rep/users/yfg436/git/ml-tabular/results/select_features/progb_vs_nonprogb_selectkbest_p005_no_correlated_selection_smartcorrelation_c09/train.csv --test-path /well/immune-rep/users/yfg436/git/ml-tabular/results/select_features/progb_vs_nonprogb_selectkbest_p005_no_correlated_selection_smartcorrelation_c09/test.csv --target-column is_progb"
+# sbatch -J tune_models_progb_vs_nonprogb_selectkbest_p005_nocorr_smartcorr_c09_repeatedcv -p long --mem=300G --cpus-per-task=40 --output=logs/%x.log.out --error=logs/%x.log.err --wrap="python tune_models.py --n-jobs 40 --optuna-n-trials 500 --mlflow-experiment-name progb_vs_nonprogb_selectkbest_p005_no_correlated_selection_smartcorrelation_c09_repeatedcv --train-path /well/immune-rep/users/yfg436/git/ml-tabular/results/select_features/progb_vs_nonprogb_selectkbest_p005_no_correlated_selection_smartcorrelation_c09/train.csv --test-path /well/immune-rep/users/yfg436/git/ml-tabular/results/select_features/progb_vs_nonprogb_selectkbest_p005_no_correlated_selection_smartcorrelation_c09/test.csv --target-column is_progb"
 
 # sbatch -J tune_models_progb_vs_nonprogb_selectkbest_p005_nocorr_summary -p long --mem=100G --cpus-per-task=11 --output=logs/%x.log.out --error=logs/%x.log.err --wrap="python tune_models.py --n-jobs 10 --mlflow-experiment-name progb_vs_nonprogb_selectkbest_p005_no_correlated_selection --train-path /well/immune-rep/users/yfg436/git/ml-tabular/results/summarise_bootstrap_features/progb_vs_nonprogb_selectkbest_p005_no_correlated_selection/train.csv --test-path /well/immune-rep/users/yfg436/git/ml-tabular/results/summarise_bootstrap_features/progb_vs_nonprogb_selectkbest_p005_no_correlated_selection/test.csv --target-column is_progb"
 
@@ -33,7 +33,12 @@ from sklearn.ensemble import AdaBoostClassifier, ExtraTreesClassifier, RandomFor
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, log_loss, roc_auc_score
-from sklearn.model_selection import StratifiedKFold, cross_val_score, train_test_split
+from sklearn.model_selection import (
+    RepeatedStratifiedKFold,
+    StratifiedKFold,
+    cross_val_score,
+    train_test_split,
+)
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sklearn.svm import LinearSVC, SVC
@@ -52,6 +57,7 @@ top_models_to_tune = [
 
 test_size = 0.2
 cv_folds = 5
+cv_repeats = 10
 scoring_metric = "roc_auc" #"roc_auc_ovr"
 
 parser = argparse.ArgumentParser()
@@ -97,6 +103,27 @@ parser.add_argument(
     help="Random seed used for CV splitting, model seeds, Optuna, and bootstrap CIs.",
 )
 parser.add_argument(
+    "--cv-strategy",
+    choices=["repeated_stratified_kfold", "stratified_kfold"],
+    default="repeated_stratified_kfold",
+    help=(
+        "Selection CV strategy used for Optuna scoring and saved split models. "
+        "Calibration always uses ordinary StratifiedKFold."
+    ),
+)
+parser.add_argument(
+    "--cv-folds",
+    type=int,
+    default=cv_folds,
+    help="Number of folds for selection and calibration CV.",
+)
+parser.add_argument(
+    "--cv-repeats",
+    type=int,
+    default=cv_repeats,
+    help="Number of repeats for repeated_stratified_kfold selection CV.",
+)
+parser.add_argument(
     "--ci-bootstrap-n",
     type=int,
     default=200,
@@ -114,6 +141,14 @@ optuna_n_trials = args.optuna_n_trials
 if optuna_n_trials < 1:
     raise ValueError("optuna_n_trials must be at least 1")
 random_state = args.random_state
+cv_strategy = args.cv_strategy
+cv_folds = args.cv_folds
+if cv_folds < 2:
+    raise ValueError("cv_folds must be at least 2")
+cv_repeats = args.cv_repeats
+if cv_repeats < 1:
+    raise ValueError("cv_repeats must be at least 1")
+cv_repeats_used = cv_repeats if cv_strategy == "repeated_stratified_kfold" else "unused"
 n_jobs = args.n_jobs
 if n_jobs < 1:
     raise ValueError("n_jobs must be at least 1")
@@ -238,7 +273,28 @@ preprocessor = ColumnTransformer(
     ]
 )
 
-cv = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=random_state)
+if cv_strategy == "repeated_stratified_kfold":
+    selection_cv = RepeatedStratifiedKFold(
+        n_splits=cv_folds,
+        n_repeats=cv_repeats,
+        random_state=random_state,
+    )
+elif cv_strategy == "stratified_kfold":
+    selection_cv = StratifiedKFold(
+        n_splits=cv_folds,
+        shuffle=True,
+        random_state=random_state,
+    )
+else:
+    raise ValueError(f"Unsupported cv_strategy: {cv_strategy}")
+
+calibration_cv = StratifiedKFold(
+    n_splits=cv_folds,
+    shuffle=True,
+    random_state=random_state,
+)
+selection_cv_splits = selection_cv.get_n_splits(X_train, y_train)
+calibration_cv_splits = calibration_cv.get_n_splits(X_train, y_train)
 
 def build_pipeline(trial, model_name, fit_label=None):
     if model_name == "logreg":
@@ -590,7 +646,9 @@ def save_best_param_cv_fold_models(
     best_params,
     X_train,
     y_train,
-    cv,
+    selection_cv,
+    cv_strategy,
+    cv_folds,
     scoring_metric,
     num_classes,
     cv_fold_model_dir,
@@ -601,14 +659,21 @@ def save_best_param_cv_fold_models(
     summary_rows = []
     assignment_rows = []
 
-    for fold_idx, (train_indices, validation_indices) in enumerate(
-        cv.split(X_train, y_train),
+    for split_idx, (train_indices, validation_indices) in enumerate(
+        selection_cv.split(X_train, y_train),
         start=1,
     ):
+        if cv_strategy == "repeated_stratified_kfold":
+            repeat_idx = ((split_idx - 1) // cv_folds) + 1
+            fold_within_repeat = ((split_idx - 1) % cv_folds) + 1
+        else:
+            repeat_idx = np.nan
+            fold_within_repeat = split_idx
+
         fold_pipeline = build_pipeline(
             FixedTrial(best_params),
             best_model_name,
-            fit_label=f"cv_fold_{fold_idx}",
+            fit_label=f"cv_split_{split_idx:03d}",
         )
         X_fold_train = X_train.iloc[train_indices]
         y_fold_train = y_train.iloc[train_indices]
@@ -624,12 +689,16 @@ def save_best_param_cv_fold_models(
             num_classes=num_classes,
         )
 
-        model_path = os.path.join(cv_fold_model_dir, f"fold_{fold_idx}.pkl")
+        model_path = os.path.join(cv_fold_model_dir, f"fold_{split_idx:03d}.pkl")
         joblib.dump(fold_pipeline, model_path)
 
         summary_rows.append(
             {
-                "fold": fold_idx,
+                "fold": split_idx,
+                "split": split_idx,
+                "repeat": repeat_idx,
+                "fold_within_repeat": fold_within_repeat,
+                "cv_strategy": cv_strategy,
                 "model_path": model_path,
                 "model_family": best_model_name,
                 "scoring_metric": scoring_metric,
@@ -642,7 +711,11 @@ def save_best_param_cv_fold_models(
         assignment_rows.extend(
             {
                 "row_index": str(X_train.index[row_index]),
-                "fold": fold_idx,
+                "fold": split_idx,
+                "split": split_idx,
+                "repeat": repeat_idx,
+                "fold_within_repeat": fold_within_repeat,
+                "cv_strategy": cv_strategy,
                 "role": "train",
             }
             for row_index in train_indices
@@ -650,7 +723,11 @@ def save_best_param_cv_fold_models(
         assignment_rows.extend(
             {
                 "row_index": str(X_train.index[row_index]),
-                "fold": fold_idx,
+                "fold": split_idx,
+                "split": split_idx,
+                "repeat": repeat_idx,
+                "fold_within_repeat": fold_within_repeat,
+                "cv_strategy": cv_strategy,
                 "role": "validation",
             }
             for row_index in validation_indices
@@ -1049,7 +1126,7 @@ def make_objective(model_name):
             pipeline,
             X_train,
             y_train,
-            cv=cv,
+            cv=selection_cv,
             scoring=scoring_metric,
             n_jobs=1,
             error_score="raise",
@@ -1086,7 +1163,14 @@ for lazy_name in top_models_to_tune:
         log_data_source_params()
         mlflow.log_param("model_family", model_name)
         mlflow.log_param("lazy_name", lazy_name)
-        mlflow.log_param("cv_folds", cv.get_n_splits())
+        mlflow.log_param("cv_strategy", cv_strategy)
+        mlflow.log_param("cv_folds", cv_folds)
+        mlflow.log_param("cv_repeats", cv_repeats)
+        mlflow.log_param("cv_repeats_used", cv_repeats_used)
+        mlflow.log_param("selection_cv_splits", selection_cv_splits)
+        mlflow.log_param("calibration_cv_strategy", "stratified_kfold")
+        mlflow.log_param("calibration_cv_folds", cv_folds)
+        mlflow.log_param("calibration_cv_splits", calibration_cv_splits)
         mlflow.log_param("scoring", scoring_metric)
         mlflow.log_param("optuna_n_trials", optuna_n_trials)
         mlflow.log_param("n_jobs", n_jobs)
@@ -1188,7 +1272,9 @@ for _, model_row in results_df.iterrows():
         best_params=best_params,
         X_train=X_train,
         y_train=y_train,
-        cv=cv,
+        selection_cv=selection_cv,
+        cv_strategy=cv_strategy,
+        cv_folds=cv_folds,
         scoring_metric=scoring_metric,
         num_classes=num_classes,
         cv_fold_model_dir=cv_fold_model_dir,
@@ -1227,7 +1313,7 @@ for _, model_row in results_df.iterrows():
     calibrated_model = CalibratedClassifierCV(
         estimator=calibration_pipeline,
         method="sigmoid",
-        cv=cv,
+        cv=calibration_cv,
         ensemble=False,
     )
     calibrated_model.fit(X_train, y_train)
@@ -1394,10 +1480,16 @@ for _, model_row in results_df.iterrows():
         log_data_source_params()
         mlflow.log_param("model_family", model_name)
         mlflow.log_param("lazy_name", lazy_name)
-        mlflow.log_param("cv_folds", cv.get_n_splits())
+        mlflow.log_param("cv_strategy", cv_strategy)
+        mlflow.log_param("cv_folds", cv_folds)
+        mlflow.log_param("cv_repeats", cv_repeats)
+        mlflow.log_param("cv_repeats_used", cv_repeats_used)
+        mlflow.log_param("selection_cv_splits", selection_cv_splits)
         mlflow.log_param("scoring_metric", scoring_metric)
         mlflow.log_param("calibration_method", "sigmoid")
-        mlflow.log_param("calibration_cv_folds", cv.get_n_splits())
+        mlflow.log_param("calibration_cv_strategy", "stratified_kfold")
+        mlflow.log_param("calibration_cv_folds", cv_folds)
+        mlflow.log_param("calibration_cv_splits", calibration_cv_splits)
         mlflow.log_param("calibration_ensemble", False)
         mlflow.log_param("n_jobs", n_jobs)
         mlflow.log_param("random_state", random_state)
